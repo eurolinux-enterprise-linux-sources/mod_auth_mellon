@@ -1,0 +1,50 @@
+From ffaa2098518c7dec427b51acf06e23c5053c119a Mon Sep 17 00:00:00 2001
+From: Simo Sorce <simo@redhat.com>
+Date: Fri, 15 Aug 2014 14:39:58 -0400
+Subject: [PATCH] Add support for AssertionConsumerServiceURL
+
+Apperently some IdPs like PicketLink insist they reaaaally want to see
+AssertionConsumerServiceURL as part of the Authentication Request.
+
+Provide it if allowed by the SP metadata.
+
+Signed-off-by: Simo Sorce <simo@redhat.com>
+---
+ auth_mellon_handler.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/auth_mellon_handler.c b/auth_mellon_handler.c
+index 2a0bd741277fb0a986acbf3a72d4c37e01d6827e..242530fbe8e35291d7dc9b388b867ed25dd60d05 100644
+--- a/auth_mellon_handler.c
++++ b/auth_mellon_handler.c
+@@ -2642,6 +2642,7 @@ static int am_send_authn_request(request_rec *r, const char *idp,
+     char *sso_url;
+     gint ret;
+     am_dir_cfg_rec *dir_cfg;
++    char *acs_url;
+ 
+     dir_cfg = am_get_dir_cfg(r);
+ 
+@@ -2757,6 +2758,19 @@ static int am_send_authn_request(request_rec *r, const char *idp,
+     /* sso_url no longer needed. */
+     g_free(sso_url);
+ 
++    /* Some IdPs insist they want to see an AttributeConsumerServiceURL
++     * attribute in the authentication request, so try to add one if the
++     * metadata contains one */
++    acs_url = lasso_provider_get_assertion_consumer_service_url(
++        LASSO_PROVIDER(server), NULL);
++    if (acs_url) {
++        request->AssertionConsumerServiceURL = g_strdup(acs_url);
++        /* Can't set request->ProtocolBinding (which is usually set along side
++         * AssertionConsumerServiceURL) as there is no immediate function
++         * like lasso_provider_get_assertion_consumer_service_url to get them.
++         * So leave that empty for now, it is not strictly required */
++    }
++
+     LASSO_PROFILE(login)->msg_relayState = g_strdup(return_to);
+ 
+     ret = lasso_login_build_authn_request_msg(login);
+-- 
+1.9.3
+
