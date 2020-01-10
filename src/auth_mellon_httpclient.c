@@ -19,15 +19,16 @@
  *
  */
 
-
 #include "auth_mellon.h"
 
 #include <curl/curl.h>
 
-
 /* The size of the blocks we will allocate. */
 #define AM_HC_BLOCK_SIZE 1000
 
+#ifdef APLOG_USE_MODULE
+APLOG_USE_MODULE(auth_mellon);
+#endif
 
 /* This structure describes a single-linked list of downloaded blocks. */
 typedef struct am_hc_block_s {
@@ -97,24 +98,25 @@ static am_hc_block_t *am_hc_block_write(
 {
     apr_size_t num_cpy;
 
-    /* Find the number of bytes we should write to this block. */
-    num_cpy = AM_HC_BLOCK_SIZE - block->used;
-    if(num_cpy > size) {
-        num_cpy = size;
-    }
+    while(size > 0) {
+        /* Find the number of bytes we should write to this block. */
+        num_cpy = AM_HC_BLOCK_SIZE - block->used;
+        if(num_cpy == 0) {
+            /* This block is full -- allocate a new block. */
+            block->next = am_hc_block_alloc(pool);
+            block = block->next;
+            num_cpy = AM_HC_BLOCK_SIZE;
+        }
+        if(num_cpy > size) {
+            num_cpy = size;
+        }
 
-    /* Copy data to this block. */
-    memcpy(&block->data[block->used], data, num_cpy);
-    block->used += num_cpy;
+        /* Copy data to this block. */
+        memcpy(&block->data[block->used], data, num_cpy);
+        block->used += num_cpy;
 
-    if(block->used == AM_HC_BLOCK_SIZE) {
-        /* This block is full. Allocate a new block, and continue
-         * filling it.
-         */
-        block->next = am_hc_block_alloc(pool);
-
-        return am_hc_block_write(block->next, pool, &data[num_cpy],
-                                 size - num_cpy);
+        size -= num_cpy;
+        data += num_cpy;
     }
 
     /* The next write should be to this block. */
@@ -365,7 +367,7 @@ static CURL *am_httpclient_init_curl(request_rec *r, const char *uri,
  *  apr_size_t *size     This is a pointer to where we will store the length
  *                       of the downloaded data, not including the
  *                       null-terminator we add. This parameter can be NULL.
- *  apr_time_t timeout   Timeout in seconds, 0 for no timeout.
+ *  int timeout          Timeout in seconds, 0 for no timeout.
  *  long *status         Pointer to HTTP status code. 
  *
  * Returns:
@@ -374,7 +376,7 @@ static CURL *am_httpclient_init_curl(request_rec *r, const char *uri,
  */
 int am_httpclient_get(request_rec *r, const char *uri,
                       void **buffer, apr_size_t *size,
-                      apr_time_t timeout, long *status)
+                      int timeout, long *status)
 {
     am_hc_block_header_t bh;
     CURL *curl;
@@ -390,7 +392,7 @@ int am_httpclient_get(request_rec *r, const char *uri,
         return HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    res = curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
+    res = curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)timeout);
     if(res != CURLE_OK) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
                       "Failed to download data from the uri \"%s\", "
@@ -399,7 +401,7 @@ int am_httpclient_get(request_rec *r, const char *uri,
         goto cleanup_fail;
     }
     
-    res = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, timeout);
+    res = curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, (long)timeout);
     if(res != CURLE_OK) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
                       "Failed to download data from the uri \"%s\", "

@@ -1,0 +1,41 @@
+commit c29123244e546986ff3c9e6fe94772c4411adf2b
+Author: Olav Morken <olav.morken@uninett.no>
+Date:   Wed Aug 16 17:28:16 2017 +0200
+
+    Make MellonUser case-insensitive.
+    
+    MellonUser used to perform its attribute match in a case-sesnsitive
+    manner, while environment variables are stored in a case-insensitive
+    table in Apache.
+    
+    The result is a bit of inconsistency between the way mod_auth_mellon
+    handles the attribute names and the way they are accessed other places
+    in Apache.
+    
+    This patch changes the code to use a case-insensitive match when
+    processing the MellonUser directive.
+    
+    Fixes issue #131.
+
+diff --git a/auth_mellon_cache.c b/auth_mellon_cache.c
+index cd3b9b0..7d51589 100644
+--- a/auth_mellon_cache.c
++++ b/auth_mellon_cache.c
+@@ -552,7 +552,7 @@ void am_cache_env_populate(request_rec *r, am_cache_entry_t *t)
+     if (am_cache_entry_slot_is_empty(&t->user)) {
+         for(i = 0; i < t->size; ++i) {
+             varname = am_cache_entry_get_string(t, &t->env[i].varname);
+-            if (strcmp(varname, d->userattr) == 0) {
++            if (strcasecmp(varname, d->userattr) == 0) {
+                 value = am_cache_entry_get_string(t, &t->env[i].value);
+                 status = am_cache_entry_store_string(t, &t->user, value);
+                 if (status != 0) {
+@@ -592,7 +592,7 @@ void am_cache_env_populate(request_rec *r, am_cache_entry_t *t)
+          * If we find a variable remapping to MellonUser, use it.
+          */
+         if (am_cache_entry_slot_is_empty(&t->user) &&
+-            (strcmp(varname, d->userattr) == 0)) {
++            (strcasecmp(varname, d->userattr) == 0)) {
+             status = am_cache_entry_store_string(t, &t->user, value);
+             if (status != 0) {
+                 ap_log_rerror(APLOG_MARK, APLOG_NOTICE, 0, r,

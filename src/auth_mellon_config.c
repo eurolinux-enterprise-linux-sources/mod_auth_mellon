@@ -21,6 +21,10 @@
 
 #include "auth_mellon.h"
 
+#ifdef APLOG_USE_MODULE
+APLOG_USE_MODULE(auth_mellon);
+#endif
+
 /* This is the default endpoint path. Remember to update the description of
  * the MellonEndpointPath configuration directive if you change this.
  */
@@ -38,9 +42,13 @@ static const char *default_user_attribute = "NAME_ID";
  */
 static const char *default_cookie_name = "cookie";
 
-/* The default setting for cookie flags is to not enforce HttpOnly and secure
+/* The default setting for cookie is to not enforce secure flag
  */
 static const int default_secure_cookie = 0; 
+
+/* The default setting for cookie is to not enforce HttpOnly flag
+ */
+static const int default_http_only_cookie = 0;
 
 /* The default setting for setting MELLON_SESSION
  */
@@ -63,7 +71,7 @@ static const apr_time_t post_ttl = 15 * 60;
 /* saved POST session maximum size
  * the MellonPostSize configuration directive if you change this.
  */
-static const apr_size_t post_size = 1024 * 1024 * 1024;
+static const apr_size_t post_size = 1024 * 1024;
 
 /* maximum saved POST sessions
  * the MellonPostCount configuration directive if you change this.
@@ -84,6 +92,9 @@ static const int default_env_vars_index_start = -1;
  * the MellonEnvVarsSetCount configuration directive if you change this.
  */
 static const int default_env_vars_count_in_n = -1;
+
+/* The default list of trusted redirect domains. */
+static const char * const default_redirect_domains[] = { "[self]", NULL };
 
 /* This function handles configuration directives which set a 
  * multivalued string slot in the module configuration (the destination
@@ -406,6 +417,35 @@ static const char *am_set_module_config_int_slot(cmd_parms *cmd,
     return ap_set_int_slot(cmd, am_get_mod_cfg(cmd->server), arg);
 }
 
+/* This function handles the MellonCookieSameSite configuration directive.
+ * This directive can be set to "lax" or "strict"
+ *
+ * Parameters:
+ *  cmd_parms *cmd       The command structure for this configuration
+ *                       directive.
+ *  void *struct_ptr     Pointer to the current directory configuration.
+ *  const char *arg      The string argument following this configuration
+ *                       directive in the configuraion file.
+ *
+ * Returns:
+ *  NULL on success or an error string if the argument is wrong.
+ */
+static const char *am_set_samesite_slot(cmd_parms *cmd,
+                                      void *struct_ptr,
+                                      const char *arg)
+{
+    am_dir_cfg_rec *d = (am_dir_cfg_rec *)struct_ptr;
+
+    if(!strcasecmp(arg, "lax")) {
+        d->cookie_samesite = am_samesite_lax;
+    } else if(!strcasecmp(arg, "strict")) {
+        d->cookie_samesite = am_samesite_strict;
+    } else {
+        return "The MellonCookieSameSite parameter must be 'lax' or 'strict'";
+    }
+
+    return NULL;
+}
 
 /* This function handles the MellonEnable configuration directive.
  * This directive can be set to "off", "info" or "auth".
@@ -439,6 +479,39 @@ static const char *am_set_enable_slot(cmd_parms *cmd,
     return NULL;
 }
 
+
+/* This function handles the MellonSecureCookie configuration directive.
+ * This directive can be set to "on", "off", "secure" or "httponly".
+ *
+ * Parameters:
+ *  cmd_parms *cmd       The command structure for this configuration
+ *                       directive.
+ *  void *struct_ptr     Pointer to the current directory configuration.
+ *  const char *arg      The string argument following this configuration
+ *                       directive in the configuraion file.
+ *
+ * Returns:
+ *  NULL on success or an error string if the argument is wrong.
+ */
+static const char *am_set_secure_slots(cmd_parms *cmd,
+                                      void *struct_ptr,
+                                      const char *arg)
+{
+    am_dir_cfg_rec *d = (am_dir_cfg_rec *)struct_ptr;
+
+    if(!strcasecmp(arg, "on")) {
+        d->secure = 1;
+        d->http_only = 1;
+    } else if(!strcasecmp(arg, "secure")) {
+        d->secure = 1;
+    } else if(!strcasecmp(arg, "httponly")) {
+        d->http_only = 1;
+    } else if(strcasecmp(arg, "off")) {
+        return "parameter must be 'on', 'off', 'secure' or 'httponly'";
+    }
+
+    return NULL;
+}
 
 /* This function handles the obsolete MellonDecoder configuration directive.
  * It is a no-op.
@@ -895,6 +968,43 @@ static const char *am_set_merge_env_vars(cmd_parms *cmd,
     return NULL;
 }
 
+/* Handle MellonRedirectDomains option.
+ *
+ * Parameters:
+ *  cmd_parms *cmd       The command structure for this configuration
+ *                       directive.
+ *  void *struct_ptr     Pointer to the current directory configuration.
+ *                       NULL if we are not in a directory configuration.
+ *  int argc             Number of redirect domains.
+ *  char *const argv[]   List of redirect domains.
+ *
+ * Returns:
+ *  NULL on success, or errror string on failure.
+ */
+static const char *am_set_redirect_domains(cmd_parms *cmd,
+                                          void *struct_ptr,
+                                          int argc,
+                                          char *const argv[])
+{
+    am_dir_cfg_rec *cfg = (am_dir_cfg_rec *)struct_ptr;
+    const char **redirect_domains;
+    int i;
+
+    if (argc < 1)
+        return apr_psprintf(cmd->pool, "%s takes at least one arguments",
+                            cmd->cmd->name);
+
+    redirect_domains = apr_palloc(cmd->pool, sizeof(const char *) * (argc + 1));
+    for (i = 0; i < argc; i++) {
+        redirect_domains[i] = argv[i];
+    }
+    redirect_domains[argc] = NULL;
+
+    cfg->redirect_domains = redirect_domains;
+
+    return NULL;
+}
+
 /* This array contains all the configuration directive which are handled
  * by auth_mellon.
  */    
@@ -926,7 +1036,7 @@ const command_rec auth_mellon_commands[] = {
         (void *)APR_OFFSETOF(am_mod_cfg_rec, lock_file),
         RSRC_CONF,
         "The lock file for session synchronization."
-        " Default value is \"/tmp/mellonLock\"."
+        " Default value is \"/var/run/mod_auth_mellon.lock\"."
         ), 
     AP_INIT_TAKE1(
         "MellonPostDirectory",
@@ -934,7 +1044,7 @@ const command_rec auth_mellon_commands[] = {
         (void *)APR_OFFSETOF(am_mod_cfg_rec, post_dir),
         RSRC_CONF,
         "The directory for saving POST requests."
-        " Default value is \"/var/tmp/mellonpost\"."
+        " Not set by default."
         ), 
     AP_INIT_TAKE1(
         "MellonPostTTL",
@@ -942,7 +1052,7 @@ const command_rec auth_mellon_commands[] = {
         (void *)APR_OFFSETOF(am_mod_cfg_rec, post_ttl),
         RSRC_CONF,
         "The time to live for saved POST requests in seconds."
-        " Default value is 15 mn."
+        " Default value is 900 (15 minutes)."
         ), 
     AP_INIT_TAKE1(
         "MellonPostCount",
@@ -958,7 +1068,7 @@ const command_rec auth_mellon_commands[] = {
         (void *)APR_OFFSETOF(am_mod_cfg_rec, post_size),
         RSRC_CONF,
         "The maximum size of a saved POST, in bytes."
-        " Default value is 1 MB."
+        " Default value is 1048576 (1 MB)."
         ), 
 
 
@@ -992,13 +1102,15 @@ const command_rec auth_mellon_commands[] = {
         " cookie name, and the default name of the cookie will therefore"
         " be 'mellon-cookie'."
         ),
-    AP_INIT_FLAG(
+    AP_INIT_TAKE1(
         "MellonSecureCookie",
-        ap_set_flag_slot,
-        (void *)APR_OFFSETOF(am_dir_cfg_rec, secure),
+        am_set_secure_slots,
+        NULL,
         OR_AUTHCFG,
         "Whether the cookie set by auth_mellon should have HttpOnly and"
-        " secure flags set. Default is off."
+        " secure flags set. Default is 'off'. Once 'on' - both flags will"
+        " be set. Values 'httponly' or 'secure' will respectively set only"
+        " one flag."
         ),
     AP_INIT_TAKE1(
         "MellonCookieDomain",
@@ -1016,6 +1128,14 @@ const command_rec auth_mellon_commands[] = {
         "The path of the cookie which auth_mellon will set. Defaults to"
         " '/'."
         ),
+      AP_INIT_TAKE1(
+        "MellonCookieSameSite",
+        am_set_samesite_slot,
+        NULL,
+        OR_AUTHCFG,
+        "The SameSite value for the auth_mellon cookie. Defaults to"
+        " having no SameSite value. Accepts values of Lax or Strict."
+        ), 
     AP_INIT_TAKE1(
         "MellonUser",
         ap_set_string_slot,
@@ -1214,8 +1334,8 @@ const command_rec auth_mellon_commands[] = {
         ap_set_int_slot,
         (void *)APR_OFFSETOF(am_dir_cfg_rec, probe_discovery_timeout),
         OR_AUTHCFG,
-        "The timeout of IdP probe discovery service. "
-        "Default is 1s"
+        "The timeout in seconds of IdP probe discovery service. "
+        "The default is unset, which means that this feature is disabled."
         ),
     AP_INIT_TAKE12(
         "MellonProbeDiscoveryIdP",
@@ -1250,6 +1370,13 @@ const command_rec auth_mellon_commands[] = {
         OR_AUTHCFG,
         "Check address given in SubjectConfirmationData Address attribute. Default is on."
         ),
+    AP_INIT_FLAG(
+        "MellonSendCacheControlHeader",
+        ap_set_flag_slot,
+        (void *)APR_OFFSETOF(am_dir_cfg_rec, send_cache_control_header),
+        OR_AUTHCFG,
+        "Send the cache-control header on responses. Default is on."
+        ),
     AP_INIT_TAKE1(
         "MellonDoNotVerifyLogoutSignature",
         am_set_do_not_verify_logout_signature,
@@ -1270,7 +1397,7 @@ const command_rec auth_mellon_commands[] = {
         am_set_merge_env_vars,
         NULL,
         OR_AUTHCFG,
-        "Whether to merge environement variables multi-values or not. Default is off."
+        "Whether to merge environment variables multi-values or not. Default is off."
         "When first parameter is on, optional second parameter is the separator, "
         "defaulting to semicolon."
         ),
@@ -1294,6 +1421,13 @@ const command_rec auth_mellon_commands[] = {
         (void *)APR_OFFSETOF(am_dir_cfg_rec, ecp_send_idplist),
         OR_AUTHCFG,
         "Whether to send an ECP client a list of IdP's. Default is off."
+        ),
+    AP_INIT_TAKE_ARGV(
+        "MellonRedirectDomains",
+        am_set_redirect_domains,
+        NULL,
+        OR_AUTHCFG,
+        "List of domains we can redirect to."
         ),
     {NULL}
 };
@@ -1348,12 +1482,14 @@ void *auth_mellon_dir_config(apr_pool_t *p, char *d)
 
     dir->varname = default_cookie_name;
     dir->secure = default_secure_cookie;
+    dir->http_only = default_http_only_cookie;
     dir->merge_env_vars = default_merge_env_vars;
     dir->env_vars_index_start = default_env_vars_index_start;
     dir->env_vars_count_in_n = default_env_vars_count_in_n;
     dir->cond = apr_array_make(p, 0, sizeof(am_cond_t));
     dir->cookie_domain = NULL;
     dir->cookie_path = NULL;
+    dir->cookie_samesite = am_samesite_default;
     dir->envattr   = apr_hash_make(p);
     dir->userattr  = default_user_attribute;
     dir->idpattr  = NULL;
@@ -1389,8 +1525,10 @@ void *auth_mellon_dir_config(apr_pool_t *p, char *d)
     dir->server = NULL;
     dir->authn_context_class_ref = apr_array_make(p, 0, sizeof(char *));
     dir->subject_confirmation_data_address_check = inherit_subject_confirmation_data_address_check;
+    dir->send_cache_control_header = inherit_send_cache_control_header;
     dir->do_not_verify_logout_signature = apr_hash_make(p);
     dir->post_replay = inherit_post_replay;
+    dir->redirect_domains = default_redirect_domains;
 
     dir->ecp_send_idplist = inherit_ecp_send_idplist;
 
@@ -1468,6 +1606,10 @@ void *auth_mellon_dir_merge(apr_pool_t *p, void *base, void *add)
                         add_cfg->secure :
                         base_cfg->secure);
 
+    new_cfg->http_only = (add_cfg->http_only != default_http_only_cookie ?
+                        add_cfg->http_only :
+                        base_cfg->http_only);
+
     new_cfg->merge_env_vars = (add_cfg->merge_env_vars != default_merge_env_vars ?
                                add_cfg->merge_env_vars :
                                base_cfg->merge_env_vars);
@@ -1487,6 +1629,10 @@ void *auth_mellon_dir_merge(apr_pool_t *p, void *base, void *add)
     new_cfg->cookie_path = (add_cfg->cookie_path != NULL ?
                         add_cfg->cookie_path :
                         base_cfg->cookie_path);
+
+    new_cfg->cookie_samesite = (add_cfg->cookie_samesite != am_samesite_default ?
+                              add_cfg->cookie_samesite :
+                              base_cfg->cookie_samesite);
 
     new_cfg->cond = apr_array_copy(p,
                                    (!apr_is_empty_array(add_cfg->cond)) ?
@@ -1621,9 +1767,18 @@ void *auth_mellon_dir_merge(apr_pool_t *p, void *base, void *add)
 
     new_cfg->subject_confirmation_data_address_check =
         CFG_MERGE(add_cfg, base_cfg, subject_confirmation_data_address_check);
+
+    new_cfg->send_cache_control_header =
+        CFG_MERGE(add_cfg, base_cfg, send_cache_control_header);
+
     new_cfg->post_replay = CFG_MERGE(add_cfg, base_cfg, post_replay);
 
     new_cfg->ecp_send_idplist = CFG_MERGE(add_cfg, base_cfg, ecp_send_idplist);
+
+    new_cfg->redirect_domains =
+        (add_cfg->redirect_domains != default_redirect_domains ?
+         add_cfg->redirect_domains :
+         base_cfg->redirect_domains);
 
     return new_cfg;
 }

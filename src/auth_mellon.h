@@ -79,6 +79,11 @@
 #define AM_CACHE_DEFAULT_ENTRY_SIZE 196608
 #define AM_CACHE_MIN_ENTRY_SIZE 65536
 
+/* Internal error codes */
+#define AM_ERROR_INVALID_PAOS_HEADER 1
+#define AM_ERROR_MISSING_PAOS_HEADER 2
+#define AM_ERROR_MISSING_PAOS_MEDIA_TYPE 3
+
 
 /* This is the length of the id we use (for session IDs and
  * replaying POST data).
@@ -131,6 +136,12 @@ typedef enum {
 } am_enable_t;
 
 typedef enum {
+  am_samesite_default,
+  am_samesite_lax,
+  am_samesite_strict
+} am_samesite_t;
+
+typedef enum {
     AM_COND_FLAG_NULL = 0x000, /* No flags */
     AM_COND_FLAG_OR   = 0x001, /* Or with  next condition */
     AM_COND_FLAG_NOT  = 0x002, /* Negate this condition */
@@ -168,11 +179,13 @@ typedef struct am_dir_cfg_rec {
 
     const char *varname;
     int secure;
+    int http_only;
     const char *merge_env_vars;
     int env_vars_index_start;
     int env_vars_count_in_n;
     const char *cookie_domain;
     const char *cookie_path;
+    am_samesite_t cookie_samesite;
     apr_array_header_t *cond;
     apr_hash_t *envattr;
     const char *userattr;
@@ -226,10 +239,15 @@ typedef struct am_dir_cfg_rec {
 
     /* AuthnContextClassRef list */
     apr_array_header_t *authn_context_class_ref;
+
     /* Controls the checking of SubjectConfirmationData.Address attribute */
     int subject_confirmation_data_address_check;
+
     /* MellonDoNotVerifyLogoutSignature idp set */
     apr_hash_t *do_not_verify_logout_signature;
+
+    /* Controls whether the cache control header is set */
+    int send_cache_control_header;
 
     /* Whether we should replay POST data after authentication. */
     int post_replay;
@@ -239,12 +257,25 @@ typedef struct am_dir_cfg_rec {
 
     /* Whether to send an ECP client a list of IdP's */
     int ecp_send_idplist;
+
+    /* List of domains we can redirect to. */
+    const char * const *redirect_domains;
+
 } am_dir_cfg_rec;
+
+/* Bitmask for PAOS service options */
+typedef enum {
+    ECP_SERVICE_OPTION_CHANNEL_BINDING = 1,
+    ECP_SERVICE_OPTION_HOLDER_OF_KEY = 2,
+    ECP_SERVICE_OPTION_WANT_AUTHN_SIGNED = 4,
+    ECP_SERVICE_OPTION_DELEGATION = 8,
+} ECPServiceOptions;
 
 typedef struct am_req_cfg_rec {
     char *cookie_value;
 #ifdef HAVE_ECP
     bool ecp_authn_req;
+    ECPServiceOptions ecp_service_options;
 #endif /* HAVE_ECP */
 } am_req_cfg_rec;
 
@@ -259,6 +290,7 @@ typedef struct am_cache_env_t {
 
 typedef struct am_cache_entry_t {
     char key[AM_CACHE_KEYSIZE];
+    am_cache_storage_t cookie_token;
     apr_time_t access;
     apr_time_t expires;
     int logged_in;
@@ -320,6 +352,11 @@ extern const am_error_map_t auth_mellon_errormap[];
 static const int default_subject_confirmation_data_address_check = 1;
 static const int inherit_subject_confirmation_data_address_check = -1;
 
+/** Default values for seting the cache-control header
+ */
+static const int default_send_cache_control_header = 1;
+static const int inherit_send_cache_control_header = -1;
+
 /* Default and inherit values for MellonPostReplay option. */
 static const int default_post_replay = 0;
 static const int inherit_post_replay = -1;
@@ -337,6 +374,7 @@ void *auth_mellon_server_config(apr_pool_t *p, server_rec *s);
 const char *am_cookie_get(request_rec *r);
 void am_cookie_set(request_rec *r, const char *id);
 void am_cookie_delete(request_rec *r);
+const char *am_cookie_token(request_rec *r);
 
 
 void am_cache_init(am_mod_cfg_rec *mod_cfg);
@@ -344,7 +382,9 @@ am_cache_entry_t *am_cache_lock(server_rec *s,
                                 am_cache_key_t type, const char *key);
 const char *am_cache_entry_get_string(am_cache_entry_t *e,
                                       am_cache_storage_t *slot);
-am_cache_entry_t *am_cache_new(server_rec *s, const char *key);
+am_cache_entry_t *am_cache_new(server_rec *s,
+                               const char *key,
+                               const char *cookie_token);
 void am_cache_unlock(server_rec *s, am_cache_entry_t *entry);
 
 void am_cache_update_expires(am_cache_entry_t *t, apr_time_t expires);
@@ -373,6 +413,7 @@ void am_delete_request_session(request_rec *r, am_cache_entry_t *session);
 
 
 char *am_reconstruct_url(request_rec *r);
+int am_validate_redirect_url(request_rec *r, const char *url);
 int am_check_permissions(request_rec *r, am_cache_entry_t *session);
 void am_set_cache_control_headers(request_rec *r);
 int am_read_post_data(request_rec *r, char **data, apr_size_t *length);
@@ -401,7 +442,7 @@ const char *am_get_mime_header(request_rec *r, const char *m, const char *h);
 const char *am_get_mime_body(request_rec *r, const char *mime);
 char *am_get_service_url(request_rec *r, 
                          LassoProfile *profile, char *service_name);
-bool am_validate_paos_header(request_rec *r, const char *header);
+bool am_parse_paos_header(request_rec *r, const char *header, ECPServiceOptions *options_return);
 bool am_header_has_media_type(request_rec *r, const char *header,
                               const char *media_type);
 const char *am_get_config_langstring(apr_hash_t *h, const char *lang);
@@ -410,7 +451,8 @@ int am_get_boolean_query_parameter(request_rec *r, const char *name,
 char *am_get_assertion_consumer_service_by_binding(LassoProvider *provider, const char *binding);
 
 #ifdef HAVE_ECP
-bool am_is_paos_request(request_rec *r);
+char *am_ecp_service_options_str(apr_pool_t *pool, ECPServiceOptions options);
+bool am_is_paos_request(request_rec *r, int *error_code);
 #endif /* HAVE_ECP */
 
 int am_auth_mellon_user(request_rec *r);
@@ -420,7 +462,7 @@ int am_handler(request_rec *r);
 
 int am_httpclient_get(request_rec *r, const char *uri, 
                       void **buffer, apr_size_t *size, 
-                      apr_time_t timeout, long *status);
+                      int timeout, long *status);
 int am_httpclient_post(request_rec *r, const char *uri,
                        const void *post_data, apr_size_t post_length,
                        const char *content_type,

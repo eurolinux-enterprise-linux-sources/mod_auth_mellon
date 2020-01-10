@@ -19,9 +19,11 @@
  *
  */
 
-
 #include "auth_mellon.h"
 
+#ifdef APLOG_USE_MODULE
+APLOG_USE_MODULE(auth_mellon);
+#endif
 
 /*
  * Note:
@@ -285,8 +287,8 @@ static guint am_server_add_providers(am_dir_cfg_rec *cfg, request_rec *r)
         if (error != 0) {
             ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
                           "Error adding metadata \"%s\" to "
-                          "lasso server objects: %s.",
-                          idp_metadata->file, lasso_strerror(error));
+                          "lasso server objects. Lasso error: [%i] %s",
+                          idp_metadata->file, error, lasso_strerror(error));
         }
     }
 
@@ -678,7 +680,8 @@ static int am_handle_logout_request(request_rec *r,
     /* Process the logout message. Ignore missing signature. */
     res = lasso_logout_process_request_msg(logout, msg);
 #ifdef HAVE_lasso_profile_set_signature_verify_hint
-    if(res != 0 && res != LASSO_DS_ERROR_SIGNATURE_NOT_FOUND) {
+    if(res != 0 && res != LASSO_DS_ERROR_SIGNATURE_NOT_FOUND &&
+       logout->parent.remote_providerID != NULL) {
         if (apr_hash_get(cfg->do_not_verify_logout_signature,
                          logout->parent.remote_providerID,
                          APR_HASH_KEY_STRING)) {
@@ -787,7 +790,8 @@ static int am_handle_logout_response(request_rec *r, LassoLogout *logout)
 
     res = lasso_logout_process_response_msg(logout, r->args);
 #ifdef HAVE_lasso_profile_set_signature_verify_hint
-    if(res != 0 && res != LASSO_DS_ERROR_SIGNATURE_NOT_FOUND) {
+    if(res != 0 && res != LASSO_DS_ERROR_SIGNATURE_NOT_FOUND &&
+       logout->parent.remote_providerID != NULL) {
         if (apr_hash_get(cfg->do_not_verify_logout_signature,
                          logout->parent.remote_providerID,
                          APR_HASH_KEY_STRING)) {
@@ -837,6 +841,14 @@ static int am_handle_logout_response(request_rec *r, LassoLogout *logout)
         return rc;
     }
 
+    /* Make sure that it is a valid redirect URL. */
+    rc = am_validate_redirect_url(r, return_to);
+    if (rc != OK) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "Invalid target domain in logout response RelayState parameter.");
+        return rc;
+    }
+
     apr_table_setn(r->headers_out, "Location", return_to);
     return HTTP_SEE_OTHER;
 }
@@ -873,6 +885,13 @@ static int am_init_logout_request(request_rec *r, LassoLogout *logout)
         ap_log_rerror(APLOG_MARK, APLOG_ERR, rc, r,
                       "Could not urldecode ReturnTo value.");
         return HTTP_BAD_REQUEST;
+    }
+
+    rc = am_validate_redirect_url(r, return_to);
+    if (rc != OK) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "Invalid target domain in logout request ReturnTo parameter.");
+        return rc;
     }
 
     /* Disable the the local session (in case the IdP doesn't respond). */
@@ -1341,6 +1360,10 @@ static int am_validate_conditions(request_rec *r,
     LassoSaml2AudienceRestriction *ar;
 
     conditions = assertion->Conditions;
+    if (conditions == NULL) {
+        /* An assertion without conditions -- nothing to validate. */
+        return OK;
+    }
     if (!LASSO_IS_SAML2_CONDITIONS(conditions)) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
                       "Wrong type of Conditions node.");
@@ -1533,6 +1556,12 @@ static int add_attributes(am_cache_entry_t *session, request_rec *r,
             if (!LASSO_IS_SAML2_ATTRIBUTE(attribute)) {
                 ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
                               "Wrong type of Attribute node.");
+                continue;
+            }
+
+            if (attribute->Name == NULL) {
+                ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r,
+                              "SAML 2.0 attribute without name.");
                 continue;
             }
 
@@ -1856,6 +1885,13 @@ static int am_handle_reply_common(request_rec *r, LassoLogin *login,
     /* Check for bad characters in RelayState. */
     rc = am_check_url(r, relay_state);
     if (rc != OK) {
+        return rc;
+    }
+
+    rc = am_validate_redirect_url(r, relay_state);
+    if (rc != OK) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "Invalid target domain in logout response RelayState parameter.");
         return rc;
     }
 
@@ -2353,6 +2389,7 @@ static int am_handle_repost(request_rec *r)
     char *output;
     char *return_url;
     const char *(*post_mkform)(request_rec *, const char *);
+    int rc;
 
     if (am_cookie_get(r) == NULL) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, 
@@ -2433,6 +2470,13 @@ static int am_handle_repost(request_rec *r)
     if (am_urldecode(return_url) != OK) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "Bad repost query: return");
         return HTTP_BAD_REQUEST;
+    }
+
+    rc = am_validate_redirect_url(r, return_url);
+    if (rc != OK) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "Invalid target domain in repost request ReturnTo parameter.");
+        return rc;
     }
 
     psf_filename = apr_psprintf(r->pool, "%s/%s", mod_cfg->post_dir, psf_id);
@@ -2617,7 +2661,7 @@ static int am_set_authn_request_post_content(request_rec *r, LassoLogin *login)
  */
 static int am_set_authn_request_paos_content(request_rec *r, LassoLogin *login)
 {
-    apr_table_setn(r->headers_out, "Content-Type", MEDIA_TYPE_PAOS);
+    ap_set_content_type(r, MEDIA_TYPE_PAOS);
     ap_rputs(LASSO_PROFILE(login)->msg_body, r);
 
     return OK;
@@ -2761,8 +2805,51 @@ static int am_init_authn_request_common(request_rec *r,
 
     LASSO_PROFILE(login)->msg_relayState = g_strdup(return_to_url);
 
+#ifdef HAVE_ECP
+    {
+        am_req_cfg_rec *req_cfg;
+        ECPServiceOptions unsupported_ecp_options;
+        req_cfg = am_get_req_cfg(r);
+
+        /*
+         * Currently we only support the WANT_AUTHN_SIGNED ECP option,
+         * if a client sends us anything else let them know it's not
+         * implemented.
+         *
+         * We do test for CHANNEL_BINDING below but that's because if
+         * and when we support it we don't want to forget channel
+         * bindings require the authn request to be signed.
+         */
+        unsupported_ecp_options =
+            req_cfg->ecp_service_options &
+            ~ECP_SERVICE_OPTION_WANT_AUTHN_SIGNED;
+        if (unsupported_ecp_options) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                          "Unsupported ECP service options [%s]",
+                          am_ecp_service_options_str(r->pool,
+                                                     unsupported_ecp_options));
+            return HTTP_NOT_IMPLEMENTED;
+        }
+
+        /*
+         * The signature hint must be set prior to calling
+         * lasso_login_build_authn_request_msg
+         */
+        if (req_cfg->ecp_service_options &
+            (ECP_SERVICE_OPTION_WANT_AUTHN_SIGNED |
+             ECP_SERVICE_OPTION_CHANNEL_BINDING)) {
+            /*
+             * authnRequest should be signed if the client requested it
+             * or if channel bindings are enabled.
+             */
+            lasso_profile_set_signature_hint(LASSO_PROFILE(login),
+                                             LASSO_PROFILE_SIGNATURE_HINT_FORCE);
+        }
+    }
+#endif
+
     ret = lasso_login_build_authn_request_msg(login);
-    if(ret != 0) {
+    if (ret != 0) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
                       "Error building login request."
                       " Lasso error: [%i] %s", ret, lasso_strerror(ret));
@@ -3051,6 +3138,13 @@ static int am_handle_login(request_rec *r)
         return ret;
     }
 
+    ret = am_validate_redirect_url(r, return_to);
+    if(ret != OK) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "Invalid target domain in login request ReturnTo parameter.");
+        return ret;
+    }
+
     idp_param = am_extract_query_parameter(r->pool, r->args, "IdP");
     if(idp_param != NULL) {
         ret = am_urldecode(idp_param);
@@ -3148,7 +3242,7 @@ static int am_handle_probe_discovery(request_rec *r) {
     if (timeout == -1) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
                       "probe discovery handler invoked but not "
-                      "configured. Plase set MellonProbeDiscoveryTimeout.");
+                      "configured. Please set MellonProbeDiscoveryTimeout.");
         return HTTP_INTERNAL_SERVER_ERROR;
     }
 
@@ -3168,6 +3262,13 @@ static int am_handle_probe_discovery(request_rec *r) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, ret, r,
                       "Could not urldecode return value.");
         return HTTP_BAD_REQUEST;
+    }
+
+    ret = am_validate_redirect_url(r, return_to);
+    if (ret != OK) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "Invalid target domain in probe discovery return parameter.");
+        return ret;
     }
 
     idp_param = am_extract_query_parameter(r->pool, r->args, "returnIDParam");
@@ -3229,9 +3330,17 @@ static int am_handle_probe_discovery(request_rec *r) {
     }
 
     /* 
-     * On failure, try default
+     * On failure, fail if a MellonProbeDiscoveryIdP
+     * list was provided, otherwise try first IdP.
      */
     if (disco_idp == NULL) {
+        if (!apr_is_empty_table(cfg->probe_discovery_idp)) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                          "probeDiscovery failed and non empty "
+                          "MellonProbeDiscoveryIdP was provided.");
+            return HTTP_INTERNAL_SERVER_ERROR;
+        }
+
         disco_idp = am_first_idp(r);
         if (disco_idp == NULL) {
             ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, 
@@ -3388,6 +3497,7 @@ int am_auth_mellon_user(request_rec *r)
     am_dir_cfg_rec *dir = am_get_dir_cfg(r);
     int return_code = HTTP_UNAUTHORIZED;
     am_cache_entry_t *session;
+    const char *ajax_header;
 
     if (r->main) {
         /* We are a subrequest. Trust the main request to have
@@ -3403,7 +3513,9 @@ int am_auth_mellon_user(request_rec *r)
     }
 
     /* Set defaut Cache-Control headers within this location */
-    am_set_cache_control_headers(r);
+    if (CFG_VALUE(dir, send_cache_control_header)) {
+        am_set_cache_control_headers(r);
+    }
 
     /* Check if this is a request for one of our endpoints. We check if
      * the uri starts with the path set with the MellonEndpointPath
@@ -3429,6 +3541,19 @@ int am_auth_mellon_user(request_rec *r)
                 am_release_request_session(r, session);
             }
 
+            /*
+             * If this is an AJAX request, we cannot proceed to the IdP,
+             * Just fail early to save our resources
+             */
+            ajax_header = apr_table_get(r->headers_in, "X-Request-With");
+            if (ajax_header != NULL &&
+                strcmp(ajax_header, "XMLHttpRequest") == 0) {
+                    ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,
+                      "Deny unauthenticated X-Request-With XMLHttpRequest "
+                      "(AJAX) request");
+                    return HTTP_FORBIDDEN;
+            }
+
 #ifdef HAVE_ECP
             /*
              * If PAOS set a flag on the request indicating we're
@@ -3438,7 +3563,12 @@ int am_auth_mellon_user(request_rec *r)
              * See am_check_uid for detailed explanation.
              */
 
-            if (am_is_paos_request(r)) {
+            bool is_paos;
+            int error_code;
+
+            is_paos = am_is_paos_request(r, &error_code);
+            if (error_code) return HTTP_BAD_REQUEST;
+            if (is_paos) {
                 am_req_cfg_rec *req_cfg;
 
                 req_cfg = am_get_req_cfg(r);
@@ -3525,6 +3655,12 @@ int am_check_uid(request_rec *r)
         return OK;
     }
 
+    /* Check that the user has enabled authentication for this directory. */
+    if(dir->enable_mellon == am_enable_off
+       || dir->enable_mellon == am_enable_default) {
+	return DECLINED;
+    }
+
 #ifdef HAVE_ECP
     am_req_cfg_rec *req_cfg = am_get_req_cfg(r);
     if (req_cfg->ecp_authn_req) {
@@ -3594,7 +3730,7 @@ int am_check_uid(request_rec *r)
     return_code = am_check_permissions(r, session);
     if(return_code != OK) {
         am_release_request_session(r, session);
-        return HTTP_UNAUTHORIZED;
+        return return_code;
     }
 
     /* The user has been authenticated, and we can now populate r->user
