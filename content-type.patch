@@ -1,0 +1,36 @@
+commit 040a1ae5cb2aab38b2bc716cc3d0d6fa7b998a7a
+Author: John Dennis <jdennis@redhat.com>
+Date:   Mon Jan 16 09:02:06 2017 -0500
+
+    Use ap_set_content_type() to set "Content-Type" header
+    
+    Formerly we were setting the response header "Content-Type" in
+    r->headers_out directly via the apr_table_setn() call. Although using
+    apr_table_setn() is appropriate for many HTTP headers Apache actively
+    manages a small set of headers in
+    http_filters.c:ap_http_header_filter(). These managed headers are
+    derived from values maintained in the request_rec. "Content-Type" is
+    one of the managed headers.
+    
+    Because we didn't set r->content_type field via the
+    ap_set_content_type() call and instead directly updated the
+    r->headers_out table our value for "Content-Type" was overwriten when
+    the ap_http_header_filter() was run just prior to emitting the
+    response with the result the "Content-Type" header returned to the
+    client was incorrect.
+    
+    Signed-off-by: John Dennis <jdennis@redhat.com>
+
+diff --git a/auth_mellon_handler.c b/auth_mellon_handler.c
+index a55828a..25365de 100644
+--- a/auth_mellon_handler.c
++++ b/auth_mellon_handler.c
+@@ -2655,7 +2655,7 @@ static int am_set_authn_request_post_content(request_rec *r, LassoLogin *login)
+  */
+ static int am_set_authn_request_paos_content(request_rec *r, LassoLogin *login)
+ {
+-    apr_table_setn(r->headers_out, "Content-Type", MEDIA_TYPE_PAOS);
++    ap_set_content_type(r, MEDIA_TYPE_PAOS);
+     ap_rputs(LASSO_PROFILE(login)->msg_body, r);
+ 
+     return OK;

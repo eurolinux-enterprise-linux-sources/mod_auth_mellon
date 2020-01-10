@@ -1,0 +1,34 @@
+commit 912aa852ebd78577f59cf7958c709acea98ace4c
+Author: John Dennis <jdennis@redhat.com>
+Date:   Fri Apr 8 09:01:22 2016 -0400
+
+    am_check_uid() should be no-op if mellon not enabled
+    
+    mod_auth_mellon was interferring with other Apache authentication
+    modules (e.g. mod_auth_kerb) because when the Apache check_user_id
+    hook ran the logic in am_check_uid would execute even if mellon was
+    not enabled for the location. This short circuited the hook execution
+    and never allowed the authentication enabled for the location to
+    execute. It resulted in HTTP_UNAUTHORIZED being returned with the
+    client then expecting a WWW-Authenticate header field causing the
+    client to attempt to authenticate again.
+    
+    Signed-off-by: John Dennis <jdennis@redhat.com>
+
+diff --git a/auth_mellon_handler.c b/auth_mellon_handler.c
+index a72e1ca..864396f 100644
+--- a/auth_mellon_handler.c
++++ b/auth_mellon_handler.c
+@@ -3625,6 +3625,12 @@ int am_check_uid(request_rec *r)
+         return OK;
+     }
+ 
++    /* Check that the user has enabled authentication for this directory. */
++    if(dir->enable_mellon == am_enable_off
++       || dir->enable_mellon == am_enable_default) {
++	return DECLINED;
++    }
++
+ #ifdef HAVE_ECP
+     am_req_cfg_rec *req_cfg = am_get_req_cfg(r);
+     if (req_cfg->ecp_authn_req) {
