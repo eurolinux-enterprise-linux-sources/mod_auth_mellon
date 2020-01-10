@@ -1,0 +1,2115 @@
+commit e8579f6387d9841ce619d836110050fb18117753
+Author: John Dennis <jdennis@redhat.com>
+Date:   Wed Jun 14 13:56:18 2017 -0400
+
+    Add diagnostic logging
+    
+    Field experience with Mellon has demonstrated there are many
+    opportunities for deployment problems. Although there are tools such
+    as browser plugins which can capture SAML messages it's onerous for
+    site personnel to install and capture the relevant information. The
+    problem with this approach is further compounded by the fact the
+    external SAML messages are not correlated to Mellon's
+    requests/responses. Mellon currently can dump the Lasso session and
+    SAML Response messages and place them in Apache environment variables,
+    however these do not appear in the log file. To get them into the log
+    you have to add custom logging to the Apache config. Another issue is
+    the dumps are not human readable, they are base64 encoded, anyone
+    looking at the logs after setting up the custom logging will have to
+    find the base64 text and then manually copy the text into an external
+    base64 decoder. At that point you'll discover the XML is not pretty
+    printed making human interpretation difficult.
+    
+    The Mellon debug messages written to the Apache error are often
+    insufficient to diagnose problems. And since the Mellon log messages
+    are written to the Apache error log they are interspersed with a lot
+    of non-Mellon message.
+    
+    Compounding the problem of writing Mellon debug messages to the Apache
+    error log is the fact Apache log messages have a fixed maximum length
+    (currently 8192) which is insufficient to completely write out such
+    things as SAML Assertions, metadata, etc. Apache logging also escapes
+    all control characters with the consequence line breaks are not
+    preserved and what was a nicely formatted human readable piece of text
+    becomes a single line with escape characters and may be truncated.
+    
+    It would be really nice if we could capture diagnostic information
+    with these properties:
+    
+    * All relevant data is collected in exactly one file.
+    
+    * Only information relevant to Mellon appears in the file.
+    
+    * All information is human readable (pretty printed, decrypted) with
+      no need to rely on other tools.
+    
+    * The diagnostic information is grouped by requests.
+    
+    * The requests can be cross correlated with other Apache logs because
+      they utilize the same unique request identifier.
+    
+    This patch adds diagnostic logging to a independent Mellon diagnostics
+    log file. Every piece of relevant information is captured, including:
+    
+    * Request information which includes:
+    
+      - Request method
+      - Request URL (raw and processed)
+      - Scheme
+      - Port
+      - Request query parameters
+      - Server name
+      - Unique request ID
+      - process ID, thread ID
+      - Request headers
+    
+    * Mellon per directory configuration
+    
+      A complete dump of the entire am_dir_cfg_rec structure keyed using
+      both the Mellon directive it is associated with and it's internal
+      name. This is emitted once on first use for a given URL.
+    
+      The per directory dump includes the pathname of each file read as
+      well as the file contents. This includes:
+    
+      - IdP metadata
+      - SP metadata
+      - SP cert
+      - SP key
+      - IdP public key file
+      - IdP CA file
+    
+    * All session management operations
+    
+      - cookie
+      - session lookup
+      - session creation
+      - session deletion
+      - cache management
+      - cache entry information
+    
+    * All SAML messages
+    
+      Each SAML message is decrypted, decoded and XML pretty printed in
+      human readable form.
+    
+    * Request pipeline operations
+    
+      What operations Mellon performs, what decisions it makes and what
+      data is being used to make those decisions.
+    
+    * Response
+    
+      - response status
+      - response headers
+      - Apache user name
+      - auth_type
+      - all Apache environment variables
+    
+    Diagnostics can be enabled/disabled both at compile time and run
+    time. Compile time inclusion of diagnostics is managed with the
+    ENABLE_DIAGNOSTICS preprocssor symbol. The configure script now accepts
+    the
+    
+      --enable-diagnostics and --disable-diagnostics
+    
+    option. Building with diagnostics is disabled by default, you must
+    specify --enable-diagnostics to enable the run time option of generating
+    diagnostics.
+    
+    The following server config directives have been added (e.g. may be
+    specified in the main server config area or within a <VirtualHost>
+    directive). If Mellon was not built with diagnostics enabled then
+    these config directives are no-ops and their use will generated a
+    warning in the log file indicating they have been ignored and to be
+    effective you must builld Mellon with diagnostics enabled.
+    
+      MellonDiagnosticsFile:
+        The name of the diagnostics file or pipe,
+        (default is logs/mellon_diagnostics)
+    
+      MellonDiagnosticsEnable:
+        Currently either On or Off but it is designed so it can take other
+        flags in the future to control what type of information is
+        reported.
+    
+    Signed-off-by: John Dennis <jdennis@redhat.com>
+
+diff --git a/Makefile.in b/Makefile.in
+index 731919e..3656bec 100644
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -1,8 +1,11 @@
+ 
+ # Source files. mod_auth_mellon.c must be the first file.
+ SRC=mod_auth_mellon.c \
+-	auth_mellon_cache.c auth_mellon_config.c \
+-	auth_mellon_cookie.c auth_mellon_handler.c \
++	auth_mellon_cache.c \
++	auth_mellon_config.c \
++	auth_mellon_cookie.c \
++	auth_mellon_diagnostics.c \
++	auth_mellon_handler.c \
+ 	auth_mellon_util.c \
+ 	auth_mellon_session.c \
+ 	auth_mellon_httpclient.c
+@@ -25,7 +28,7 @@ DISTFILES=$(SRC) \
+ all:	mod_auth_mellon.la
+ 
+ mod_auth_mellon.la: $(SRC) auth_mellon.h auth_mellon_compat.h
+-	@APXS2@ -Wc,"-std=c99 @OPENSSL_CFLAGS@ @LASSO_CFLAGS@ @CURL_CFLAGS@ @GLIB_CFLAGS@ @CFLAGS@" -Wl,"@OPENSSL_LIBS@ @LASSO_LIBS@ @CURL_LIBS@ @GLIB_LIBS@" -Wc,-Wall -Wc,-g -c $(SRC)
++	@APXS2@ -Wc,"-std=c99 @MELLON_CFLAGS@ @OPENSSL_CFLAGS@ @LASSO_CFLAGS@ @CURL_CFLAGS@ @GLIB_CFLAGS@ @CFLAGS@" -Wl,"@OPENSSL_LIBS@ @LASSO_LIBS@ @CURL_LIBS@ @GLIB_LIBS@" -Wc,-Wall -Wc,-g -c $(SRC)
+ 
+ 
+ # Building configure (for distribution)
+@@ -46,6 +49,7 @@ distfile:	@NAMEVER@.tar.gz
+ .PHONY:	clean
+ clean:
+ 	rm -f mod_auth_mellon.la
++	rm -f $(SRC:%.c=%.o)
+ 	rm -f $(SRC:%.c=%.lo)
+ 	rm -f $(SRC:%.c=%.slo)
+ 	rm -rf .libs/
+diff --git a/README b/README
+index e084ef4..8211d66 100644
+--- a/README
++++ b/README
+@@ -132,6 +132,24 @@ MellonPostSize 1048576
+ # Default: MellonPostCount 100
+ MellonPostCount 100
+ 
++# MellonDiagnosticsFile If Mellon was built with diagnostic capability
++# then diagnostic is written here, it may be either a filename or a pipe.
++# If it's a filename then the resulting path is  relative to the ServerRoot.
++# If the value is preceeded by the pipe character "|" it should be followed
++# by a path to a program to receive the log information on its standard input.
++# This is a server context directive, hence it may be specified in the
++# main server config area or within a <VirtualHost> directive.
++# Default: logs/mellon_diagnostics
++MellonDiagnosticsFile logs/mellon_diagnostics
++
++# MellonDiagnosticsEnable If Mellon was built with diagnostic capability
++# then this is a list of words controlling diagnostic output.
++# Currently only On and Off are supported.
++# This is a server context directive, hence it may be specified in the
++# main server config area or within a <VirtualHost> directive.
++# Default: Off
++MellonDiagnosticsEnable Off
++
+ ###########################################################################
+ # End of global configuration for mod_auth_mellon.
+ ###########################################################################
+diff --git a/auth_mellon.h b/auth_mellon.h
+index a6fa34c..6ce6a8e 100644
+--- a/auth_mellon.h
++++ b/auth_mellon.h
+@@ -85,6 +85,14 @@
+ #define AM_ERROR_MISSING_PAOS_MEDIA_TYPE 3
+ 
+ 
++#ifdef ENABLE_DIAGNOSTICS
++typedef enum {
++    AM_DIAG_FLAG_ENABLED       = (1 << 0),
++    AM_DIAG_FLAG_DISABLE       = 0,
++    AM_DIAG_FLAG_ENABLE_ALL    = ~0,
++} am_diag_flags_t;
++#endif
++
+ /* This is the length of the id we use (for session IDs and
+  * replaying POST data).
+  */
+@@ -100,6 +108,9 @@
+ 
+ #define am_get_req_cfg(r) (am_req_cfg_rec *)ap_get_module_config((r)->request_config, &auth_mellon_module)
+ 
++#ifdef ENABLE_DIAGNOSTICS
++#define am_get_diag_cfg(s) (&(am_get_srv_cfg((s)))->diag_cfg)
++#endif
+ 
+ typedef struct am_mod_cfg_rec {
+     int cache_size;
+@@ -124,8 +135,20 @@ typedef struct am_mod_cfg_rec {
+ } am_mod_cfg_rec;
+ 
+ 
++#ifdef ENABLE_DIAGNOSTICS
++typedef struct am_diag_cfg_rec {
++    const char *filename;
++    apr_file_t *fd;
++    am_diag_flags_t flags;
++    apr_table_t *dir_cfg_emitted;
++} am_diag_cfg_rec;
++#endif
++
+ typedef struct am_srv_cfg_rec {
+     am_mod_cfg_rec *mc;
++#ifdef ENABLE_DIAGNOSTICS
++    am_diag_cfg_rec diag_cfg;
++#endif
+ } am_srv_cfg_rec;
+ 
+ typedef enum {
+@@ -284,7 +307,6 @@ typedef struct am_dir_cfg_rec {
+ 
+     /* List of domains we can redirect to. */
+     const char * const *redirect_domains;
+-
+ } am_dir_cfg_rec;
+ 
+ /* Bitmask for PAOS service options */
+@@ -301,6 +323,9 @@ typedef struct am_req_cfg_rec {
+     bool ecp_authn_req;
+     ECPServiceOptions ecp_service_options;
+ #endif /* HAVE_ECP */
++#ifdef ENABLE_DIAGNOSTICS
++    bool diag_emitted;
++#endif
+ } am_req_cfg_rec;
+ 
+ typedef struct am_cache_storage_t {
+@@ -393,6 +418,7 @@ static const int inherit_ecp_send_idplist = -1;
+ void *auth_mellon_dir_config(apr_pool_t *p, char *d);
+ void *auth_mellon_dir_merge(apr_pool_t *p, void *base, void *add);
+ void *auth_mellon_server_config(apr_pool_t *p, server_rec *s);
++void *auth_mellon_srv_merge(apr_pool_t *p, void *base, void *add);
+ 
+ 
+ const char *am_cookie_get(request_rec *r);
+@@ -503,4 +529,72 @@ int am_httpclient_post_str(request_rec *r, const char *uri,
+ 
+ extern module AP_MODULE_DECLARE_DATA auth_mellon_module;
+ 
++#ifdef ENABLE_DIAGNOSTICS
++
++/* Initializing an apr_time_t to 0x7fffffffffffffffLL yields an
++ * iso 8601 time with 1 second precision of "294247-01-10T04:00:54Z"
++ * this is 22 characters, +1 for null terminator. */
++#define ISO_8601_BUF_SIZE 23
++
++typedef struct {
++    bool req_headers_written;
++} am_diag_request_data;
++
++const char *
++am_diag_cache_key_type_str(am_cache_key_t key_type);
++
++const char *
++am_diag_cond_str(request_rec *r, const am_cond_t *cond);
++
++int
++am_diag_finalize_request(request_rec *r);
++
++const char *
++am_diag_lasso_http_method_str(LassoHttpMethod http_method);
++
++void
++am_diag_log_cache_entry(request_rec *r, int level, am_cache_entry_t *entry,
++                        const char *fmt, ...)
++    __attribute__((format(printf,4,5)));
++
++void
++am_diag_log_file_data(request_rec *r, int level, am_file_data_t *file_data,
++                      const char *fmt, ...)
++    __attribute__((format(printf,4,5)));
++
++int
++am_diag_log_init(apr_pool_t *pc, apr_pool_t *p, apr_pool_t *pt, server_rec *s);
++
++void
++am_diag_log_lasso_node(request_rec *r, int level, LassoNode *node,
++                       const char *fmt, ...)
++    __attribute__((format(printf,4,5)));
++
++void
++am_diag_log_profile(request_rec *r, int level, LassoProfile *profile,
++                    const char *fmt, ...)
++    __attribute__((format(printf,4,5)));
++
++void
++am_diag_printf(request_rec *r, const char *fmt, ...)
++    __attribute__((format(printf,2,3)));
++
++void
++am_diag_rerror(const char *file, int line, int module_index,
++               int level, apr_status_t status,
++               request_rec *r, const char *fmt, ...);
++
++char *
++am_diag_time_t_to_8601(request_rec *r, apr_time_t t);
++
++#else  /* ENABLE_DIAGNOSTICS */
++
++#define am_diag_log_cache_entry(...) do {} while(0)
++#define am_diag_log_file_data(...) do {} while(0)
++#define am_diag_log_lasso_node(...) do {} while(0)
++#define am_diag_log_profile(...) do {} while(0)
++#define am_diag_printf(...) do {} while(0)
++
++#endif /* ENABLE_DIAGNOSTICS */
++
+ #endif /* MOD_AUTH_MELLON_H */
+diff --git a/auth_mellon_cache.c b/auth_mellon_cache.c
+index af5c267..2115acc 100644
+--- a/auth_mellon_cache.c
++++ b/auth_mellon_cache.c
+@@ -144,11 +144,17 @@ am_cache_entry_t *am_cache_lock(request_rec *r,
+             continue;
+ 
+         if(strcmp(tablekey, key) == 0) {
++            apr_time_t now = apr_time_now();
+             /* We found the entry. */
+-            if(e->expires > apr_time_now()) {
++            if(e->expires > now) {
+                 /* And it hasn't expired. */
+                 return e;
+             }
++            else {
++                am_diag_log_cache_entry(r, 0, e,
++                                        "found expired session, now %s\n",
++                                        am_diag_time_t_to_8601(r, now));
++            }
+         }
+     }
+ 
+@@ -342,6 +348,10 @@ am_cache_entry_t *am_cache_new(request_rec *r,
+              * Update 't' and exit loop.
+              */
+             t = e;
++            am_diag_log_cache_entry(r, 0, e,
++                                    "%s ejecting expired sessions, now %s\n",
++                                    __func__,
++                                    am_diag_time_t_to_8601(r, current_time));
+             break;
+         }
+ 
+@@ -400,6 +410,11 @@ am_cache_entry_t *am_cache_new(request_rec *r,
+         return NULL;
+     }
+ 
++    am_diag_printf(r, "%s created new session, id=%s at %s"
++                   " cookie_token=\"%s\"\n",
++                   __func__, t->key, am_diag_time_t_to_8601(r, current_time),
++                   cookie_token);
++
+     return t;
+ }
+ 
+diff --git a/auth_mellon_config.c b/auth_mellon_config.c
+index c3cb5e0..66966fc 100644
+--- a/auth_mellon_config.c
++++ b/auth_mellon_config.c
+@@ -78,6 +78,15 @@ static const apr_size_t post_size = 1024 * 1024;
+  */
+ static const int post_count = 100;
+ 
++#ifdef ENABLE_DIAGNOSTICS
++/* Default filename for mellon diagnostics log file.
++ * Relative pathname is relative to server root. */
++static const char *default_diag_filename = "logs/mellon_diagnostics";
++
++/* Default state for diagnostics is off */
++static am_diag_flags_t default_diag_flags = AM_DIAG_FLAG_DISABLE;
++#endif
++
+ /* whether to merge env. vars or not
+  * the MellonMergeEnvVars configuration directive if you change this.
+  */
+@@ -470,6 +479,78 @@ static const char *am_set_module_config_int_slot(cmd_parms *cmd,
+     return ap_set_int_slot(cmd, am_get_mod_cfg(cmd->server), arg);
+ }
+ 
++/* This function handles the MellonDiagnosticsFile configuration directive.
++ * It emits as warning in the log file if Mellon is not built with
++ * diagnostics enabled.
++ *
++ * Parameters:
++ *  cmd_parms *cmd       The command structure for this configuration
++ *                       directive.
++ *  void *struct_ptr     Pointer to the current directory configuration.
++ *                       NULL if we are not in a directory configuration.
++ *  const char *arg      The string argument following this configuration
++ *                       directive in the configuraion file.
++ *
++ * Returns:
++ *  NULL on success or an error string on failure.
++ */
++static const char *am_set_module_diag_file_slot(cmd_parms *cmd,
++                                                    void *struct_ptr,
++                                                    const char *arg)
++{
++#ifdef ENABLE_DIAGNOSTICS
++    return ap_set_file_slot(cmd, am_get_diag_cfg(cmd->server), arg);
++#else
++    ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, cmd->server,
++                 "%s has no effect because Mellon was not compiled with"
++                 " diagnostics enabled, use ./configure --enable-diagnostics"
++                 " at build time to turn this feature on.",
++                 cmd->directive->directive);
++    return NULL;
++#endif
++}
++
++/* This function handles configuration directives which sets the
++ * diagnostics flags in the module configuration.
++ *
++ * Parameters:
++ *  cmd_parms *cmd       The command structure for this configuration
++ *                       directive.
++ *  void *struct_ptr     Pointer to the current directory configuration.
++ *                       NULL if we are not in a directory configuration.
++ *  const char *arg      The string argument following this configuration
++ *                       directive in the configuraion file.
++ *
++ * Returns:
++ *  NULL on success or an error string on failure.
++ */
++static const char *am_set_module_diag_flags_slot(cmd_parms *cmd,
++                                                 void *struct_ptr,
++                                                 const char *arg)
++{
++#ifdef ENABLE_DIAGNOSTICS
++    am_diag_cfg_rec *diag_cfg = am_get_diag_cfg(cmd->server);
++
++    if (strcasecmp(arg, "on") == 0) {
++        diag_cfg->flags = AM_DIAG_FLAG_ENABLE_ALL;
++    }
++    else if (strcasecmp(arg, "off") == 0) {
++        diag_cfg->flags = AM_DIAG_FLAG_DISABLE;
++    } else {
++        return apr_psprintf(cmd->pool, "%s: must be one of: 'on', 'off'",
++                            cmd->cmd->name);
++    }
++    return NULL;
++#else
++    ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, cmd->server,
++                 "%s has no effect because Mellon was not compiled with"
++                 " diagnostics enabled, use ./configure --enable-diagnostics"
++                 " at build time to turn this feature on.",
++                 cmd->directive->directive);
++    return NULL;
++#endif
++}
++
+ /* This function handles the MellonCookieSameSite configuration directive.
+  * This directive can be set to "lax" or "strict"
+  *
+@@ -684,7 +765,7 @@ static const char *am_set_setenv_no_prefix_slot(cmd_parms *cmd,
+ static int am_cond_flags(const char *arg)
+ {
+     int flags = AM_COND_FLAG_NULL; 
+-    static const char const *options[] = { 
++    static const char * const options[] = {
+         "OR",  /* AM_EXPIRE_FLAG_OR */
+         "NOT", /* AM_EXPIRE_FLAG_NOT */
+         "REG", /* AM_EXPIRE_FLAG_REG */
+@@ -1123,6 +1204,30 @@ const command_rec auth_mellon_commands[] = {
+         "The maximum size of a saved POST, in bytes."
+         " Default value is 1048576 (1 MB)."
+         ), 
++    AP_INIT_TAKE1(
++        "MellonDiagnosticsFile",
++        am_set_module_diag_file_slot,
++#ifdef ENABLE_DIAGNOSTICS
++        (void *)APR_OFFSETOF(am_diag_cfg_rec, filename),
++#else
++        NULL,
++#endif
++        RSRC_CONF,
++        "Diagnostics log file. [file|pipe] "
++        "If file then file is a filename, relative to the ServerRoot."
++        "If pipe then the filename is a pipe character \"|\", "
++        "followed by the path to a program to receive the log information "
++        "on its standard input. "
++        " Default value is \"logs/mellon_diagnostics\"."
++        ),
++    AP_INIT_ITERATE(
++        "MellonDiagnosticsEnable",
++        am_set_module_diag_flags_slot,
++        NULL,
++        RSRC_CONF,
++        "Diagnostics flags. [on|off] "
++        " Default value is \"off\"."
++        ),
+ 
+ 
+     /* Per-location configuration directives. */
+@@ -1855,6 +1960,13 @@ void *auth_mellon_server_config(apr_pool_t *p, server_rec *s)
+ 
+     srv = apr_palloc(p, sizeof(*srv));
+ 
++#ifdef ENABLE_DIAGNOSTICS
++    srv->diag_cfg.filename = default_diag_filename;
++    srv->diag_cfg.fd = NULL;
++    srv->diag_cfg.flags = default_diag_flags;
++    srv->diag_cfg.dir_cfg_emitted = apr_table_make(p, 0);
++#endif
++
+     /* we want to keeep our global configuration of shared memory and
+      * mutexes, so we try to find it in the userdata before doing anything
+      * else */
+@@ -1886,6 +1998,47 @@ void *auth_mellon_server_config(apr_pool_t *p, server_rec *s)
+     apr_pool_userdata_set(mod, key, apr_pool_cleanup_null, p);
+ 
+     srv->mc = mod;
++
+     return srv;
+ }
+ 
++/* This function merges two am_srv_cfg_rec structures.
++ * It will try to inherit from the base where possible.
++ *
++ * Parameters:
++ *  apr_pool_t *p        The pool we should allocate memory from.
++ *  void *base           The original structure.
++ *  void *add            The structure we should add to base.
++ *
++ * Returns:
++ *  The merged structure.
++ */
++void *auth_mellon_srv_merge(apr_pool_t *p, void *base, void *add)
++{
++    am_srv_cfg_rec *base_cfg = (am_srv_cfg_rec *)base;
++    am_srv_cfg_rec *new_cfg;
++
++    new_cfg = (am_srv_cfg_rec *)apr_palloc(p, sizeof(*new_cfg));
++
++    new_cfg->mc = base_cfg->mc;
++
++#ifdef ENABLE_DIAGNOSTICS
++    am_srv_cfg_rec *add_cfg = (am_srv_cfg_rec *)add;
++    new_cfg->diag_cfg.filename = (add_cfg->diag_cfg.filename !=
++                                  default_diag_filename ?
++                                  add_cfg->diag_cfg.filename :
++                                  base_cfg->diag_cfg.filename);
++
++    new_cfg->diag_cfg.fd = NULL;
++
++    new_cfg->diag_cfg.flags = (add_cfg->diag_cfg.flags !=
++                               default_diag_flags ?
++                               add_cfg->diag_cfg.flags :
++                               base_cfg->diag_cfg.flags);
++
++    new_cfg->diag_cfg.dir_cfg_emitted = apr_table_make(p, 0);
++
++#endif
++
++    return new_cfg;
++}
+diff --git a/auth_mellon_diagnostics.c b/auth_mellon_diagnostics.c
+new file mode 100644
+index 0000000..519a44f
+--- /dev/null
++++ b/auth_mellon_diagnostics.c
+@@ -0,0 +1,1017 @@
++#ifdef ENABLE_DIAGNOSTICS
++
++#include "auth_mellon.h"
++
++#if APR_HAVE_UNISTD_H
++#include <unistd.h>
++#endif
++#if APR_HAVE_PROCESS_H
++#include <process.h>            /* for getpid() on Win32 */
++#endif
++
++/*============================= Internal Static ==============================*/
++
++/*------------------ Defines ------------------*/
++
++#define AM_DIAG_ENABLED(diag_cfg)                                       \
++    (diag_cfg && diag_cfg->fd && (diag_cfg->flags & AM_DIAG_FLAG_ENABLED))
++
++/*------------------ Typedefs ------------------*/
++
++typedef struct iter_callback_data {
++    apr_file_t *diag_fd;
++    int level;
++} iter_callback_data;
++
++/*------------------ Prototypes ------------------*/
++
++static const char *
++indent(int level);
++
++static void
++write_indented_text(apr_file_t *diag_fd, int level, const char* text);
++
++static void
++am_diag_format_line(apr_pool_t *pool, apr_file_t *diag_fd, int level,
++                    const char *fmt, va_list ap);
++
++static const char *
++am_diag_cond_flag_str(request_rec *r, am_cond_flag_t flags);
++
++static const char *
++am_diag_enable_str(am_enable_t enable);
++
++static const char *
++am_diag_samesite_str(am_samesite_t samesite);
++
++static const char *
++am_diag_httpd_error_level_str(request_rec *r, int level);
++
++static apr_size_t
++am_diag_time_t_to_8601_buf(char *buf, apr_size_t buf_size, apr_time_t t);
++
++static int
++am_diag_open_log(server_rec *s, apr_pool_t *p);
++
++static int
++am_table_count(void *rec, const char *key, const char *value);
++
++static int
++log_headers(void *rec, const char *key, const char *value);
++
++static int
++log_probe_discovery_idp(void *rec, const char *key, const char *value);
++
++static void
++am_diag_log_dir_cfg(request_rec *r, int level, am_dir_cfg_rec *cfg,
++                    const char *fmt, ...)
++    __attribute__((format(printf,4,5)));
++
++static bool
++am_diag_initialize_req(request_rec *r, am_diag_cfg_rec *diag_cfg,
++                       am_req_cfg_rec *req_cfg);
++
++/*------------------ Functions ------------------*/
++
++static const char *
++indent(int level)
++{
++    static const char * const indents[] = {
++        "",                     /* 0 */
++        "  ",                   /* 1 */
++        "    ",                 /* 2 */
++        "      ",               /* 3 */
++        "        ",             /* 4 */
++        "          ",           /* 5 */
++        "            ",         /* 6 */
++        "              ",       /* 7 */
++        "                ",     /* 8 */
++        "                  ",   /* 9 */
++    };
++    int n_indents = sizeof(indents)/sizeof(indents[0]);
++
++    if (level < 0) {
++        return "";
++    }
++    if (level < n_indents) {
++        return indents[level];
++    }
++    return indents[n_indents-1];
++}
++
++static void
++write_indented_text(apr_file_t *diag_fd, int level, const char* text)
++{
++    const char *start, *end, *prefix;
++    size_t len, prefix_len;
++    bool crlf = false;
++
++    if (!text) return;
++
++    prefix = indent(level);
++    prefix_len = strlen(prefix);
++    start = end = text;
++    while (*end) {
++         /* find end of line */
++        for (; *end && *end != '\n'; end++);
++        if (*end == '\n') {
++            /* was this a crlf sequence? */
++            if (end > text && end[-1] == '\r') crlf = true;
++            /* advance past line ending */
++            end += 1;
++        }
++        /* length of line including line ending */
++        len = end - start;
++        /* write indent prefix */
++        apr_file_write_full(diag_fd, prefix, prefix_len, NULL);
++        /* write line including line ending */
++        apr_file_write_full(diag_fd, start, len, NULL);
++        /* begin again where we left off */
++        start = end;
++    }
++    /* always write a trailing line ending */
++    if (end > text && end[-1] != '\n') {
++        if (crlf) {
++            apr_file_write_full(diag_fd, "\r\n", 2, NULL);
++        } else {
++            apr_file_write_full(diag_fd, "\n", 1, NULL);
++        }
++    }
++}
++
++static void
++am_diag_format_line(apr_pool_t *pool, apr_file_t *diag_fd, int level,
++                    const char *fmt, va_list ap)
++{
++    char * buf = NULL;
++    apr_size_t buf_len;
++
++    if (fmt) {
++        buf = apr_pvsprintf(pool, fmt, ap);
++        buf_len = strlen(buf);
++        if (buf_len > 0) {
++            const char *prefix = indent(level);
++            apr_size_t prefix_len = strlen(prefix);
++            apr_file_write_full(diag_fd, prefix, prefix_len, NULL);
++            apr_file_write_full(diag_fd, buf, buf_len, NULL);
++            apr_file_putc('\n', diag_fd);
++        }
++
++    }
++}
++
++static const char *
++am_diag_cond_flag_str(request_rec *r, am_cond_flag_t flags)
++{
++    char *str;
++    char *comma;
++
++    str = apr_pstrcat(r->pool,
++                      "[",
++                      flags & AM_COND_FLAG_OR   ? "OR,"   : "",
++                      flags & AM_COND_FLAG_NOT  ? "NOT,"  : "",
++                      flags & AM_COND_FLAG_REG  ? "REG,"  : "",
++                      flags & AM_COND_FLAG_NC   ? "NC,"   : "",
++                      flags & AM_COND_FLAG_MAP  ? "MAP,"  : "",
++                      flags & AM_COND_FLAG_REF  ? "REF,"  : "",
++                      flags & AM_COND_FLAG_SUB  ? "SUB,"  : "",
++                      flags & AM_COND_FLAG_IGN  ? "IGN,"  : "",
++                      flags & AM_COND_FLAG_REQ  ? "REQ,"  : "",
++                      flags & AM_COND_FLAG_FSTR ? "FSTR," : "",
++                      "]",
++                      NULL);
++
++    /* replace trailing ",]" with "]" */
++    comma = rindex(str, ',');
++    if (comma) {
++        *comma = ']';
++        *(comma+1) = 0;
++    }
++    return str;
++}
++
++static const char *
++am_diag_enable_str(am_enable_t enable)
++{
++    switch(enable) {
++    case am_enable_default: return "default";
++    case am_enable_off:     return "off";
++    case am_enable_info:    return "info";
++    case am_enable_auth:    return "auth";
++    default:                return "unknown";
++    }
++
++}
++
++static const char *
++am_diag_samesite_str(am_samesite_t samesite)
++{
++    switch(samesite) {
++    case am_samesite_default: return "default";
++    case am_samesite_lax:     return "lax";
++    case am_samesite_strict:  return "strict";
++    default:                  return "unknown";
++    }
++}
++
++static const char *
++am_diag_httpd_error_level_str(request_rec *r, int level)
++{
++    switch(level) {
++    case APLOG_EMERG:   return "APLOG_EMERG";
++    case APLOG_ALERT:   return "APLOG_ALERT";
++    case APLOG_CRIT:    return "APLOG_CRIT";
++    case APLOG_ERR:     return "APLOG_ERR";
++    case APLOG_WARNING: return "APLOG_WARNING";
++    case APLOG_NOTICE:  return "APLOG_NOTICE";
++    case APLOG_INFO:    return "APLOG_INFO";
++    case APLOG_DEBUG:   return "APLOG_DEBUG";
++    case APLOG_TRACE1:  return "APLOG_TRACE1";
++    case APLOG_TRACE2:  return "APLOG_TRACE2";
++    case APLOG_TRACE3:  return "APLOG_TRACE3";
++    case APLOG_TRACE4:  return "APLOG_TRACE4";
++    case APLOG_TRACE5:  return "APLOG_TRACE5";
++    case APLOG_TRACE6:  return "APLOG_TRACE6";
++    case APLOG_TRACE7:  return "APLOG_TRACE7";
++    case APLOG_TRACE8:  return "APLOG_TRACE8";
++    default:
++        return apr_psprintf(r->pool, "APLOG_%d", level);
++    }
++}
++
++static apr_size_t
++am_diag_time_t_to_8601_buf(char *buf, apr_size_t buf_size, apr_time_t t)
++{
++    apr_size_t ret_size;
++    apr_time_exp_t tm;
++    const char fmt[] = "%FT%TZ";
++
++    apr_time_exp_gmt(&tm, t);
++    apr_strftime(buf, &ret_size, buf_size, fmt, &tm);
++
++    /* on errror assure string is null terminated */
++    if (ret_size == 0) buf[0] = 0;
++    return ret_size;
++}
++
++static int
++am_diag_open_log(server_rec *s, apr_pool_t *p)
++{
++    const char *server_name = NULL;
++    const char *server_desc = NULL;
++    am_diag_cfg_rec *diag_cfg = am_get_diag_cfg(s);
++
++    /* Build the ServerName as it would appear in the ServerName directive */
++    if (s->server_scheme) {
++        server_name = apr_psprintf(p, "%s://%s",
++                                       s->server_scheme, s->server_hostname);
++    } else {
++        server_name = apr_psprintf(p, "%s", s->server_hostname);
++    }
++    if (s->port) {
++        server_name = apr_psprintf(p, "%s:%u", server_name, s->port);
++    }
++
++    if (s->is_virtual) {
++        server_desc = apr_psprintf(p, "virtual server %s:%d (%s:%u)"
++                                   " ServerName=%s",
++                                   s->addrs->virthost, s->addrs->host_port,
++                                   s->defn_name, s->defn_line_number,
++                                   server_name);
++    } else {
++        server_desc = apr_psprintf(p, "main server, ServerName=%s",
++                                   server_name);
++    }
++
++    if (!(diag_cfg->flags & AM_DIAG_FLAG_ENABLED)) {
++        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s,
++                     "mellon diagnostics disabled for %s", server_desc);
++        return 1;
++    } else {
++        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, s,
++                     "mellon diagnostics enabled for %s, "
++                     "diagnostics filename=%s",
++                     server_desc, diag_cfg->filename);
++    }
++
++    if (!diag_cfg->filename || diag_cfg->fd)
++        return 1;
++
++    if (*diag_cfg->filename == '|') {
++        piped_log *pl;
++        const char *pname = ap_server_root_relative(p, diag_cfg->filename + 1);
++
++        pl = ap_open_piped_log(p, pname);
++        if (pl == NULL) {
++            ap_log_error(APLOG_MARK, APLOG_ERR, 0, s,
++                         "couldn't spawn mellon diagnostics log pipe %s",
++                         diag_cfg->filename);
++            return 0;
++        }
++        diag_cfg->fd = ap_piped_log_write_fd(pl);
++    }
++    else {
++        const char *fname = ap_server_root_relative(p, diag_cfg->filename);
++        apr_status_t rv;
++
++        if ((rv = apr_file_open(&diag_cfg->fd, fname,
++                                APR_WRITE | APR_APPEND | APR_CREATE,
++                                APR_OS_DEFAULT, p)) != APR_SUCCESS) {
++            ap_log_error(APLOG_MARK, APLOG_ERR, rv, s,
++                         "could not open mellon diagnostics log file %s.",
++                         fname);
++            return 0;
++        }
++    }
++
++    return 1;
++}
++
++static int
++am_table_count(void *rec, const char *key, const char *value)
++{
++    int *n_items = (int *)rec;
++
++    (*n_items)++;
++
++    return 1;
++}
++
++static int
++log_headers(void *rec, const char *key, const char *value)
++{
++    iter_callback_data *iter_data = (iter_callback_data *)rec;
++
++    apr_file_printf(iter_data->diag_fd, "%s%s: %s\n",
++                    indent(iter_data->level), key, value);
++
++    return 1;
++}
++
++static int
++log_probe_discovery_idp(void *rec, const char *key, const char *value)
++{
++    iter_callback_data *iter_data = (iter_callback_data *)rec;
++
++    apr_file_printf(iter_data->diag_fd,
++                    "%s%s: %s\n", indent(iter_data->level), key, value);
++
++    return 1;
++}
++
++static void
++am_diag_log_dir_cfg(request_rec *r, int level, am_dir_cfg_rec *cfg,
++                    const char *fmt, ...)
++{
++    va_list ap;
++    am_diag_cfg_rec *diag_cfg = am_get_diag_cfg(r->server);
++    am_req_cfg_rec *req_cfg = am_get_req_cfg(r);
++    int i, n_items;
++    apr_hash_index_t *hash_item;
++    GList *list_item;
++    iter_callback_data iter_data;
++
++    if (!AM_DIAG_ENABLED(diag_cfg)) return;
++    if (!am_diag_initialize_req(r, diag_cfg, req_cfg)) return;
++
++    iter_data.diag_fd = diag_cfg->fd;
++    iter_data.level = level+1;
++
++    va_start(ap, fmt);
++    am_diag_format_line(r->pool, diag_cfg->fd, level, fmt, ap);
++    va_end(ap);
++
++    if (!cfg) {
++        apr_file_flush(diag_cfg->fd);
++        return;
++    }
++
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonEnable (enable): %s\n",
++                    indent(level+1), am_diag_enable_str(cfg->enable_mellon));
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonVariable (varname): %s\n",
++                    indent(level+1), cfg->varname);
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonSecureCookie (secure): %s\n",
++                    indent(level+1), cfg->secure ? "On":"Off"); /* FIXME, should be combined? */
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonSecureCookie (httpd_only): %s\n",
++                    indent(level+1), cfg->http_only ? "On":"Off");
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonMergeEnvVars (merge_env_vars): %s\n",
++                    indent(level+1), cfg->merge_env_vars);
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonEnvVarsIndexStart (env_vars_index_start): %d\n",
++                    indent(level+1), cfg->env_vars_index_start);
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonEnvVarsSetCount (env_vars_count_in_n): %s\n",
++                    indent(level+1), cfg->env_vars_count_in_n ? "On":"Off");
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonCookieDomain (cookie_domain): %s\n",
++                    indent(level+1), cfg->cookie_domain);
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonCookiePath (cookie_path): %s\n",
++                    indent(level+1), cfg->cookie_path);
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonCookieSameSite (cookie_samesite): %s\n",
++                    indent(level+1),
++                    am_diag_samesite_str(cfg->cookie_samesite));
++
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonCond (cond): %d items\n",
++                    indent(level+1), cfg->cond->nelts);
++    for (i = 0; i < cfg->cond->nelts; i++) {
++        const am_cond_t *cond = &((am_cond_t *)(cfg->cond->elts))[i];
++        apr_file_printf(diag_cfg->fd,
++                        "%s[%2d]: %s\n",
++                        indent(level+2), i, am_diag_cond_str(r, cond));
++    }
++
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonSetEnv (envattr): %u items\n",
++                    indent(level+1), apr_hash_count(cfg->envattr));
++    for (hash_item = apr_hash_first(r->pool, cfg->envattr);
++         hash_item;
++         hash_item = apr_hash_next(hash_item)) {
++        const char *key;
++        const am_envattr_conf_t *envattr_conf;
++        const char *name;
++
++        apr_hash_this(hash_item, (void *)&key, NULL, (void *)&envattr_conf);
++
++        if (envattr_conf->prefixed) {
++            name = apr_pstrcat(r->pool, "MELLON_",
++                               envattr_conf->name, NULL);
++        } else {
++            name = envattr_conf->name;
++        }
++
++        apr_file_printf(diag_cfg->fd,
++                        "%s%s ==> %s\n",
++                        indent(level+2), key, name);
++    }
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonUser (userattr): %s\n",
++                    indent(level+1), cfg->userattr);
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonIdP (idpattr): %s\n",
++                    indent(level+1), cfg->idpattr);
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonSessionDump (dump_session): %s\n",
++                    indent(level+1), cfg->dump_session ? "On":"Off");
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonSamlResponseDump (dump_saml_response): %s\n",
++                    indent(level+1), cfg->dump_saml_response ? "On":"Off");
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonEndpointPath (endpoint_path): %s\n",
++                    indent(level+1), cfg->endpoint_path);
++    am_diag_log_file_data(r, level+1, cfg->sp_metadata_file,
++                          "MellonSPMetadataFile (sp_metadata_file):");
++    am_diag_log_file_data(r, level+1, cfg->sp_private_key_file,
++                          "MellonSPPrivateKeyFile (sp_private_key_file):");
++    am_diag_log_file_data(r, level+1, cfg->sp_cert_file,
++                          "MellonSPCertFile (sp_cert_file):");
++    am_diag_log_file_data(r, level+1, cfg->idp_public_key_file,
++                          "MellonIdPPublicKeyFile (idp_public_key_file):");
++    am_diag_log_file_data(r, level+1, cfg->idp_ca_file,
++                          "MellonIdPCAFile (idp_ca_file):");
++
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonIdPMetadataFile (idp_metadata): %d items\n",
++                    indent(level+1), cfg->idp_metadata->nelts);
++    for (i = 0; i < cfg->idp_metadata->nelts; i++) {
++        const am_metadata_t *idp_metadata;
++        idp_metadata = &(((const am_metadata_t*)cfg->idp_metadata->elts)[i]);
++
++        am_diag_log_file_data(r, level+1, idp_metadata->metadata,
++                              "[%2d] Metadata", i);
++        am_diag_log_file_data(r, level+1, idp_metadata->chain,
++                              "[%2d] Chain File", i);
++    }
++
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonIdPIgnore (idp_ignore):\n",
++                    indent(level+1));
++    for (list_item = cfg->idp_ignore, i = 0;
++         list_item;
++         list_item = g_list_next(list_item), i++) {
++        apr_file_printf(diag_cfg->fd,
++                        "%s[%2d]: %s\n",
++                        indent(level+2), i, (char *)list_item->data);
++    }
++
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonSPentityId (sp_entity_id): %s\n",
++                    indent(level+1), cfg->sp_entity_id);
++
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonOrganizationName (sp_org_name): %u items\n",
++                    indent(level+1), apr_hash_count(cfg->sp_org_name));
++    for (hash_item = apr_hash_first(r->pool, cfg->sp_org_name);
++         hash_item;
++         hash_item = apr_hash_next(hash_item)) {
++        const char *lang;
++        const char *value;
++
++        apr_hash_this(hash_item, (void *)&lang, NULL, (void *)&value);
++        apr_file_printf(diag_cfg->fd,
++                        "%s(lang=%s): %s\n",
++                        indent(level+2), lang, value);
++    }
++
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonOrganizationDisplayName (sp_org_display_name):"
++                    " %u items\n",
++                    indent(level+1), apr_hash_count(cfg->sp_org_display_name));
++    for (hash_item = apr_hash_first(r->pool, cfg->sp_org_display_name);
++         hash_item;
++         hash_item = apr_hash_next(hash_item)) {
++        const char *lang;
++        const char *value;
++
++        apr_hash_this(hash_item, (void *)&lang, NULL, (void *)&value);
++        apr_file_printf(diag_cfg->fd,
++                        "%s(lang=%s): %s\n",
++                        indent(level+2), lang, value);
++    }
++
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonOrganizationURL (sp_org_url): %u items\n",
++                    indent(level+1), apr_hash_count(cfg->sp_org_url));
++    for (hash_item = apr_hash_first(r->pool, cfg->sp_org_url);
++         hash_item;
++         hash_item = apr_hash_next(hash_item)) {
++        const char *lang;
++        const char *value;
++
++        apr_hash_this(hash_item, (void *)&lang, NULL, (void *)&value);
++        apr_file_printf(diag_cfg->fd,
++                        "%s(lang=%s): %s\n",
++                        indent(level+2), lang, value);
++    }
++
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonSessionLength (session_length): %d\n",
++                    indent(level+1), cfg->session_length);
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonNoCookieErrorPage (no_cookie_error_page): %s\n",
++                    indent(level+1), cfg->no_cookie_error_page);
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonNoSuccessErrorPage (no_success_error_page): %s\n",
++                    indent(level+1), cfg->no_success_error_page);
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonDefaultLoginPath (login_path): %s\n",
++                    indent(level+1), cfg->login_path);
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonDiscoveryURL (discovery_url): %s\n",
++                    indent(level+1), cfg->discovery_url);
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonProbeDiscoveryTimeout (probe_discovery_timeout):"
++                    " %d\n",
++                    indent(level+1), cfg->probe_discovery_timeout);
++
++    n_items = 0;
++    apr_table_do(am_table_count, &n_items, cfg->probe_discovery_idp, NULL);
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonProbeDiscoveryIdP (probe_discovery_idp):"
++                    " %d items\n",
++                    indent(level+1), n_items);
++    apr_table_do(log_probe_discovery_idp, &iter_data,
++                 cfg->probe_discovery_idp, NULL);
++
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonAuthnContextClassRef (authn_context_class_ref):"
++                    " %d items\n",
++                    indent(level+1), cfg->authn_context_class_ref->nelts);
++    for(i = 0; i < cfg->authn_context_class_ref->nelts; i++) {
++        const char *context_class;
++
++        context_class = APR_ARRAY_IDX(cfg->authn_context_class_ref, i, char *);
++        apr_file_printf(diag_cfg->fd,
++                        "%s[%2d]: %s\n",
++                        indent(level+2), i, context_class);
++    }
++
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonSubjectConfirmationDataAddressCheck"
++                    " (subject_confirmation_data_address_check): %s\n",
++                    indent(level+1),
++                    cfg->subject_confirmation_data_address_check ? "On":"Off");
++
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonDoNotVerifyLogoutSignature"
++                    " (do_not_verify_logout_signature): %u items\n",
++                    indent(level+1),
++                    apr_hash_count(cfg->do_not_verify_logout_signature));
++
++    for (hash_item = apr_hash_first(r->pool,
++                                    cfg->do_not_verify_logout_signature);
++         hash_item;
++         hash_item = apr_hash_next(hash_item)) {
++        const char *entity_id;
++
++        apr_hash_this(hash_item, (void *)&entity_id, NULL, NULL);
++
++        apr_file_printf(diag_cfg->fd,
++                        "%s%s\n",
++                        indent(level+2), entity_id);
++    }
++
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonSendCacheControlHeader"
++                    " (send_cache_control_header): %s\n",
++                    indent(level+1),
++                    cfg->send_cache_control_header ? "On":"Off");
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonPostReplay (post_replay): %s\n",
++                    indent(level+1), cfg->post_replay ? "On":"Off");
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonECPSendIDPList (ecp_send_idplist): %s\n",
++                    indent(level+1), cfg->ecp_send_idplist ? "On":"Off");
++
++    for (n_items = 0; cfg->redirect_domains[n_items] != NULL; n_items++);
++    apr_file_printf(diag_cfg->fd,
++                    "%sMellonRedirectDomains (redirect_domains): %d items\n",
++                    indent(level+1), n_items);
++    for (i = 0; cfg->redirect_domains[i] != NULL; i++) {
++        apr_file_printf(diag_cfg->fd,
++                        "%s%s\n",
++                        indent(level+2), cfg->redirect_domains[i]);
++    }
++
++    apr_file_flush(diag_cfg->fd);
++}
++
++
++static bool
++am_diag_initialize_req(request_rec *r, am_diag_cfg_rec *diag_cfg,
++                       am_req_cfg_rec *req_cfg)
++{
++    server_rec *s = r->server;
++    am_dir_cfg_rec *dir_cfg;
++    apr_os_thread_t tid = apr_os_thread_current();
++    iter_callback_data iter_data;
++    int level = 0;
++
++    if (!diag_cfg) return false;
++    if (!diag_cfg->fd) return false;
++    if (!req_cfg) return false;
++
++    if (req_cfg->diag_emitted) return true;
++
++    iter_data.diag_fd = diag_cfg->fd;
++    iter_data.level = level+1;
++
++    apr_file_puts("---------------------------------- New Request"
++                  " ---------------------------------\n", diag_cfg->fd);
++    apr_file_printf(diag_cfg->fd, "%s - %s\n", r->method, r->uri);
++    apr_file_printf(diag_cfg->fd, "log_id: %s\n", r->log_id);
++    apr_file_printf(diag_cfg->fd, "server: scheme=%s hostname=%s port=%d\n",
++                    s->server_scheme, s->server_hostname, s->port);
++    apr_file_printf(diag_cfg->fd, "pid: %" APR_PID_T_FMT ", tid: %pT\n",
++                    getpid(), &tid);
++    apr_file_printf(diag_cfg->fd, "unparsed_uri: %s\n", r->unparsed_uri);
++    apr_file_printf(diag_cfg->fd, "uri: %s\n", r->uri);
++    apr_file_printf(diag_cfg->fd, "path_info: %s\n", r->path_info);
++    apr_file_printf(diag_cfg->fd, "filename: %s\n", r->filename);
++    apr_file_printf(diag_cfg->fd, "query args: %s\n", r->args);
++
++    apr_file_printf(diag_cfg->fd, "Request Headers:\n");
++    apr_table_do(log_headers, &iter_data, r->headers_in, NULL);
++
++    req_cfg->diag_emitted = true;
++
++
++    /* Only emit directory configuration once */
++    if (!apr_table_get(diag_cfg->dir_cfg_emitted, r->uri)) {
++        dir_cfg = am_get_dir_cfg(r);
++
++        am_diag_log_dir_cfg(r, level, dir_cfg,
++                            "Mellon Directory Configuration for URL: %s",
++                            r->uri);
++        apr_table_set(diag_cfg->dir_cfg_emitted, r->uri, "1");
++    }
++    return true;
++}
++
++/*=============================== Public API =================================*/
++
++int
++am_diag_log_init(apr_pool_t *pc, apr_pool_t *p, apr_pool_t *pt, server_rec *s)
++{
++    for ( ; s ; s = s->next) {
++        if (!am_diag_open_log(s, p)) {
++            return HTTP_INTERNAL_SERVER_ERROR;
++        }
++    }
++
++    return OK;
++}
++
++int
++am_diag_finalize_request(request_rec *r)
++{
++    am_diag_cfg_rec *diag_cfg = am_get_diag_cfg(r->server);
++    am_req_cfg_rec *req_cfg = am_get_req_cfg(r);
++    int level = 0;
++    iter_callback_data iter_data;
++
++    if (!AM_DIAG_ENABLED(diag_cfg)) return OK;
++    if (!req_cfg) return OK;
++
++    if (!req_cfg->diag_emitted) return OK;
++
++    iter_data.diag_fd = diag_cfg->fd;
++    iter_data.level = level+1;
++
++    apr_file_puts("\n=== Response ===\n", diag_cfg->fd);
++    apr_file_printf(diag_cfg->fd,
++                    "Status: %s(%d)\n",
++                    r->status_line, r->status);
++    apr_file_printf(diag_cfg->fd,
++                    "user: %s auth_type=%s\n",
++                    r->user, r->ap_auth_type);
++
++    apr_file_printf(diag_cfg->fd,
++                    "Response Headers:\n");
++    apr_table_do(log_headers, &iter_data, r->headers_out, NULL);
++
++    apr_file_printf(diag_cfg->fd,
++                    "Response Error Headers:\n");
++    apr_table_do(log_headers, &iter_data, r->err_headers_out, NULL);
++
++    apr_file_printf(diag_cfg->fd,
++                    "Environment:\n");
++    apr_table_do(log_headers, &iter_data, r->subprocess_env, NULL);
++
++    return OK;
++}
++
++char *
++am_diag_time_t_to_8601(request_rec *r, apr_time_t t)
++{
++    char *buf;
++
++    buf = apr_palloc(r->pool, ISO_8601_BUF_SIZE);
++    if (!buf) return NULL;
++
++    am_diag_time_t_to_8601_buf(buf, ISO_8601_BUF_SIZE, t);
++    return buf;
++}
++
++const char *
++am_diag_cond_str(request_rec *r, const am_cond_t *cond)
++{
++    return apr_psprintf(r->pool,
++                        "varname=\"%s\" flags=%s str=\"%s\" directive=\"%s\"",
++                        cond->varname, am_diag_cond_flag_str(r, cond->flags),
++                        cond->str, cond->directive);
++}
++
++const char *
++am_diag_cache_key_type_str(am_cache_key_t key_type)
++{
++    switch(key_type) {
++    case AM_CACHE_SESSION: return "session";
++    case AM_CACHE_NAMEID : return "name id";
++    default:               return "unknown";
++    }
++}
++
++const char *
++am_diag_lasso_http_method_str(LassoHttpMethod http_method)
++{
++    switch(http_method) {
++    case LASSO_HTTP_METHOD_NONE:          return "LASSO_HTTP_METHOD_NONE";
++    case LASSO_HTTP_METHOD_ANY:           return "LASSO_HTTP_METHOD_ANY";
++    case LASSO_HTTP_METHOD_IDP_INITIATED: return "LASSO_HTTP_METHOD_IDP_INITIATED";
++    case LASSO_HTTP_METHOD_GET:           return "LASSO_HTTP_METHOD_GET";
++    case LASSO_HTTP_METHOD_POST:          return "LASSO_HTTP_METHOD_POST";
++    case LASSO_HTTP_METHOD_REDIRECT:      return "LASSO_HTTP_METHOD_REDIRECT";
++    case LASSO_HTTP_METHOD_SOAP:          return "LASSO_HTTP_METHOD_SOAP";
++    case LASSO_HTTP_METHOD_ARTIFACT_GET:  return "LASSO_HTTP_METHOD_ARTIFACT_GET";
++    case LASSO_HTTP_METHOD_ARTIFACT_POST: return "LASSO_HTTP_METHOD_ARTIFACT_POST";
++    case LASSO_HTTP_METHOD_PAOS:          return "LASSO_HTTP_METHOD_PAOS";
++    default:                              return "unknown";
++    }
++}
++
++void
++am_diag_printf(request_rec *r, const char *fmt, ...)
++{
++    va_list ap;
++    am_diag_cfg_rec *diag_cfg = am_get_diag_cfg(r->server);
++    am_req_cfg_rec *req_cfg = am_get_req_cfg(r);
++    char *buf;
++    apr_size_t buf_len;
++
++    if (!AM_DIAG_ENABLED(diag_cfg)) return;
++    if (!am_diag_initialize_req(r, diag_cfg, req_cfg)) return;
++
++
++    va_start(ap, fmt);
++    buf = apr_pvsprintf(r->pool, fmt, ap);
++    va_end(ap);
++    buf_len = strlen(buf);
++    if (buf_len > 0) {
++        apr_file_write_full(diag_cfg->fd, buf, buf_len, NULL);
++    }
++    apr_file_flush(diag_cfg->fd);
++}
++
++void
++am_diag_rerror(const char *file, int line, int module_index,
++               int level, apr_status_t status,
++               request_rec *r, const char *fmt, ...)
++{
++    va_list ap;
++    am_diag_cfg_rec *diag_cfg = am_get_diag_cfg(r->server);
++    am_req_cfg_rec *req_cfg = am_get_req_cfg(r);
++    char *buf;
++
++    if (!AM_DIAG_ENABLED(diag_cfg)) return;
++    if (!am_diag_initialize_req(r, diag_cfg, req_cfg)) return;
++
++    buf = apr_psprintf(r->pool, "[%s %s:%d] ",
++                       am_diag_httpd_error_level_str(r, level), file, line);
++    apr_file_puts(buf, diag_cfg->fd);
++
++    va_start(ap, fmt);
++    buf = apr_pvsprintf(r->pool, fmt, ap);
++    va_end(ap);
++    apr_file_puts(buf, diag_cfg->fd);
++
++    apr_file_puts(APR_EOL_STR, diag_cfg->fd);
++    apr_file_flush(diag_cfg->fd);
++}
++
++void
++am_diag_log_lasso_node(request_rec *r, int level, LassoNode *node,
++                       const char *fmt, ...)
++{
++    va_list ap;
++    am_diag_cfg_rec *diag_cfg = am_get_diag_cfg(r->server);
++    am_req_cfg_rec *req_cfg = am_get_req_cfg(r);
++    gchar *xml = NULL;
++
++    if (!AM_DIAG_ENABLED(diag_cfg)) return;
++    if (!am_diag_initialize_req(r, diag_cfg, req_cfg)) return;
++
++    va_start(ap, fmt);
++    am_diag_format_line(r->pool, diag_cfg->fd, level, fmt, ap);
++    va_end(ap);
++
++    if (node) {
++        xml = lasso_node_debug(node, 0);
++        write_indented_text(diag_cfg->fd, level+1, xml);
++        lasso_release_string(xml);
++    } else {
++        apr_file_printf(diag_cfg->fd, "node is NULL\n");
++    }
++    apr_file_flush(diag_cfg->fd);
++}
++
++void
++am_diag_log_file_data(request_rec *r, int level, am_file_data_t *file_data,
++                      const char *fmt, ...)
++{
++    va_list ap;
++    am_diag_cfg_rec *diag_cfg = am_get_diag_cfg(r->server);
++    am_req_cfg_rec *req_cfg = am_get_req_cfg(r);
++
++    if (!AM_DIAG_ENABLED(diag_cfg)) return;
++    if (!am_diag_initialize_req(r, diag_cfg, req_cfg)) return;
++
++    va_start(ap, fmt);
++    am_diag_format_line(r->pool, diag_cfg->fd, level, fmt, ap);
++    va_end(ap);
++
++    if (file_data) {
++        if (file_data->generated) {
++            apr_file_printf(diag_cfg->fd,
++                            "%sGenerated file contents:\n",
++                            indent(level+1));
++            write_indented_text(diag_cfg->fd,
++                                level+2, file_data->contents);
++        } else {
++            apr_file_printf(diag_cfg->fd,
++                            "%spathname: \"%s\"\n",
++                            indent(level+1), file_data->path);
++            if (!file_data->read_time) {
++                am_file_read(file_data);
++            }
++            if (file_data->rv == APR_SUCCESS) {
++                write_indented_text(diag_cfg->fd,
++                                    level+2, file_data->contents);
++            } else {
++                apr_file_printf(diag_cfg->fd,
++                                "%s%s\n",
++                                indent(level+1), file_data->strerror);
++            }
++        }
++    } else {
++        apr_file_printf(diag_cfg->fd,
++                        "%sfile_data: NULL\n",
++                        indent(level+1));
++    }
++
++    apr_file_flush(diag_cfg->fd);
++}
++
++void
++am_diag_log_profile(request_rec *r, int level, LassoProfile *profile,
++                    const char *fmt, ...)
++{
++    va_list ap;
++    am_diag_cfg_rec *diag_cfg = am_get_diag_cfg(r->server);
++    am_req_cfg_rec *req_cfg = am_get_req_cfg(r);
++    LassoSession *session = lasso_profile_get_session(profile);
++    GList *assertions = lasso_session_get_assertions(session, NULL);
++    GList *iter = NULL;
++    int i;
++
++    if (!AM_DIAG_ENABLED(diag_cfg)) return;
++    if (!am_diag_initialize_req(r, diag_cfg, req_cfg)) return;
++
++    va_start(ap, fmt);
++    am_diag_format_line(r->pool, diag_cfg->fd, level, fmt, ap);
++    va_end(ap);
++
++    if (profile) {
++        apr_file_printf(diag_cfg->fd,
++                        "%sProfile Type: %s\n",
++                        indent(level+1), G_OBJECT_TYPE_NAME(profile));
++
++        for (iter = assertions, i=0;
++             iter != NULL;
++             iter = g_list_next(iter), i++) {
++            LassoSaml2Assertion *assertion = NULL;
++
++            assertion = LASSO_SAML2_ASSERTION(iter->data);
++            if (!LASSO_IS_SAML2_ASSERTION(assertion)) {
++                apr_file_printf(diag_cfg->fd,
++                                "%sObject at index %d in session assertion"
++                                " list is not LassoSaml2Assertion",
++                                indent(level+1), i);
++            } else {
++                am_diag_log_lasso_node(r, level+1, &assertion->parent,
++                                       "Assertion %d", i);
++            }
++        }
++    } else {
++        apr_file_printf(diag_cfg->fd,
++                        "%sprofile is NULL\n",
++                        indent(level+1));
++    }
++
++    apr_file_flush(diag_cfg->fd);
++}
++
++void
++am_diag_log_cache_entry(request_rec *r, int level, am_cache_entry_t *entry,
++                        const char *fmt, ...)
++{
++    va_list ap;
++    am_diag_cfg_rec *diag_cfg = am_get_diag_cfg(r->server);
++    am_req_cfg_rec *req_cfg = am_get_req_cfg(r);
++
++    const char *name_id = NULL;
++
++    if (!AM_DIAG_ENABLED(diag_cfg)) return;
++    if (!am_diag_initialize_req(r, diag_cfg, req_cfg)) return;
++
++    va_start(ap, fmt);
++    am_diag_format_line(r->pool, diag_cfg->fd, level, fmt, ap);
++    va_end(ap);
++
++    if (entry) {
++        name_id = am_cache_env_fetch_first(entry, "NAME_ID");
++
++        apr_file_printf(diag_cfg->fd,
++                        "%skey: %s\n",
++                        indent(level+1), entry->key);
++        apr_file_printf(diag_cfg->fd,
++                        "%sname_id: %s\n",
++                        indent(level+1), name_id);
++        apr_file_printf(diag_cfg->fd,
++                        "%sexpires: %s\n",
++                        indent(level+1),
++                        am_diag_time_t_to_8601(r, entry->expires));
++        apr_file_printf(diag_cfg->fd,
++                        "%saccess: %s\n",
++                        indent(level+1),
++                        am_diag_time_t_to_8601(r, entry->access));
++        apr_file_printf(diag_cfg->fd,
++                        "%slogged_in: %s\n",
++                        indent(level+1), entry->logged_in ? "True" : "False");
++    } else {
++        apr_file_printf(diag_cfg->fd,
++                        "%sentry is NULL\n",
++                        indent(level+1));
++    }
++    apr_file_flush(diag_cfg->fd);
++}
++
++
++#endif /* ENABLE_DIAGNOSTICS */
+diff --git a/auth_mellon_handler.c b/auth_mellon_handler.c
+index 08b7869..0cbc0ad 100644
+--- a/auth_mellon_handler.c
++++ b/auth_mellon_handler.c
+@@ -121,6 +121,8 @@ static char *am_generate_metadata(apr_pool_t *p, request_rec *r)
+     char *cert = "";
+     const char *sp_entity_id;
+ 
++    am_diag_printf(r, "Generating SP metadata\n");
++
+     sp_entity_id = cfg->sp_entity_id ? cfg->sp_entity_id : url;
+ 
+     if (cfg->sp_cert_file && cfg->sp_cert_file->contents) {
+@@ -251,6 +253,13 @@ static guint am_server_add_providers(am_dir_cfg_rec *cfg, request_rec *r)
+ 
+         idp_metadata = &( ((const am_metadata_t*)cfg->idp_metadata->elts) [index] );
+ 
++        am_diag_log_file_data(r, 0, idp_metadata->metadata,
++                              "Loading IdP Metadata");
++        if (idp_metadata->chain) {
++            am_diag_log_file_data(r, 0, idp_metadata->chain,
++                                  "Loading IdP metadata chain");
++        }
++
+ #ifdef HAVE_lasso_server_load_metadata
+         error = lasso_server_load_metadata(cfg->server,
+                                            LASSO_PROVIDER_ROLE_IDP,
+@@ -674,6 +683,9 @@ static void am_restore_lasso_profile_state(request_rec *r,
+             am_release_request_session(r, am_session);
+         }
+     }
++    am_diag_log_cache_entry(r, 0, am_session, "%s: Session Cache Entry", __func__);
++
++    am_diag_log_profile(r, 0, profile,  "%s: Restored Profile", __func__);
+ }
+ 
+ /* This function handles an IdP initiated logout request.
+@@ -693,6 +705,8 @@ static int am_handle_logout_request(request_rec *r,
+     am_cache_entry_t *session = NULL;
+     am_dir_cfg_rec *cfg = am_get_dir_cfg(r);
+ 
++    am_diag_printf(r, "enter function %s\n", __func__);
++
+     /* Process the logout message. Ignore missing signature. */
+     res = lasso_logout_process_request_msg(logout, msg);
+ #ifdef HAVE_lasso_profile_set_signature_verify_hint
+@@ -724,6 +738,10 @@ static int am_handle_logout_request(request_rec *r,
+         rc = HTTP_BAD_REQUEST;
+         goto exit;
+     }
++
++    am_diag_printf(r, "%s name id %s\n", __func__,
++                   ((LassoSaml2NameID*)logout->parent.nameIdentifier)->content);
++
+     session = am_get_request_session_by_nameid(r,
+                     ((LassoSaml2NameID*)logout->parent.nameIdentifier)->content);
+     if (session == NULL) {
+@@ -733,6 +751,9 @@ static int am_handle_logout_request(request_rec *r,
+                       ((LassoSaml2NameID*)logout->parent.nameIdentifier)->content);
+ 
+     }
++
++    am_diag_log_cache_entry(r, 0, session, "%s", __func__);
++
+     if (session == NULL) {
+         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                       "Error processing logout request message."
+@@ -830,6 +851,9 @@ static int am_handle_logout_response(request_rec *r, LassoLogout *logout)
+ 
+     /* Delete the session. */
+     session = am_get_request_session(r);
++
++    am_diag_log_cache_entry(r, 0, session, "%s\n", __func__);
++
+     if(session != NULL) {
+         am_delete_request_session(r, session);
+     }
+@@ -1482,6 +1506,9 @@ static void am_handle_session_expire(request_rec *r, am_cache_entry_t *session,
+         /* Find timestamp. */
+         not_on_or_after = authn->SessionNotOnOrAfter;
+         if(not_on_or_after == NULL) {
++            am_diag_printf(r, "%s failed to find"
++                           " Assertion.AuthnStatement.SessionNotOnOrAfter\n",
++                           __func__);
+             continue;
+         }
+ 
+@@ -1492,6 +1519,10 @@ static void am_handle_session_expire(request_rec *r, am_cache_entry_t *session,
+             continue;
+         }
+ 
++        am_diag_printf(r, "%s Assertion.AuthnStatement.SessionNotOnOrAfter:"
++                       " %s\n",
++                       __func__, am_diag_time_t_to_8601(r, t));
++
+         /* Updates the expires timestamp if this one is earlier than the
+          * previous timestamp.
+          */
+@@ -1629,6 +1660,10 @@ static int add_attributes(am_cache_entry_t *session, request_rec *r,
+                         g_free(dump);
+                 }
+                 /* Decode and save the attribute. */
++
++                am_diag_printf(r, "%s name=%s value=%s\n",
++                               __func__, attribute->Name, content);
++
+                 ret = am_cache_env_append(session, attribute->Name, content);
+                 if(ret != OK) {
+                     return ret;
+@@ -1725,6 +1760,9 @@ static int am_handle_reply_common(request_rec *r, LassoLogin *login,
+     int rc;
+     const char *idp;
+ 
++    am_diag_log_lasso_node(r, 0, LASSO_PROFILE(login)->response,
++                           "SAMLResponse:");
++
+     url = am_reconstruct_url(r);
+     chr = strchr(url, '?');
+     if (! chr) {
+@@ -1867,7 +1905,6 @@ static int am_handle_reply_common(request_rec *r, LassoLogin *login,
+         return HTTP_INTERNAL_SERVER_ERROR;
+     }
+ 
+-
+     /* Save the profile state. */
+     rc = am_save_lasso_profile_state(r, session, LASSO_PROFILE(login),
+                                      saml_response);
+@@ -1941,6 +1978,8 @@ static int am_handle_post_reply(request_rec *r)
+     am_dir_cfg_rec *dir_cfg = am_get_dir_cfg(r);
+     int i, err;
+ 
++    am_diag_printf(r, "enter function %s\n", __func__);
++
+     /* Make sure that this is a POST request. */
+     if(r->method_number != M_POST) {
+         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+@@ -2050,6 +2089,8 @@ static int am_handle_paos_reply(request_rec *r)
+     char *relay_state = NULL;
+     int i, err;
+ 
++    am_diag_printf(r, "enter function %s\n", __func__);
++
+     /* Make sure that this is a POST request. */
+     if(r->method_number != M_POST) {
+         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+@@ -2137,6 +2178,8 @@ static int am_handle_artifact_reply(request_rec *r)
+     char *saml_art;
+     char *post_data;
+ 
++    am_diag_printf(r, "enter function %s\n", __func__);
++
+     /* Make sure that this is a GET request. */
+     if(r->method_number != M_GET && r->method_number != M_POST) {
+         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+@@ -2408,6 +2451,8 @@ static int am_handle_repost(request_rec *r)
+     const char *(*post_mkform)(request_rec *, const char *);
+     int rc;
+ 
++    am_diag_printf(r, "enter function %s\n", __func__);
++
+     if (am_cookie_get(r) == NULL) {
+         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, 
+                       "Repost query without a session");
+@@ -2570,6 +2615,8 @@ static int am_handle_metadata(request_rec *r)
+     LassoServer *server;
+     const char *data;
+ 
++    am_diag_printf(r, "enter function %s\n", __func__);
++
+     server = am_get_lasso_server(r);
+     if(server == NULL)
+         return HTTP_INTERNAL_SERVER_ERROR;
+@@ -2898,6 +2945,11 @@ static int am_init_authn_request_common(request_rec *r,
+ static int am_set_authn_request_content(request_rec *r, LassoLogin *login)
+ 
+ {
++
++    am_diag_log_lasso_node(r, 0, LASSO_PROFILE(login)->request,
++                           "SAML AuthnRequest: http_method=%s",
++                           am_diag_lasso_http_method_str(login->http_method));
++
+     switch (login->http_method) {
+     case LASSO_HTTP_METHOD_REDIRECT:
+         return am_set_authn_request_redirect_content(r, login);
+@@ -3112,6 +3164,8 @@ static int am_handle_auth(request_rec *r)
+     am_dir_cfg_rec *cfg = am_get_dir_cfg(r);
+     const char *relay_state;
+ 
++    am_diag_printf(r, "enter function %s\n", __func__);
++
+     relay_state = am_reconstruct_url(r);
+ 
+     /* Check if IdP discovery is in use and no IdP was selected yet */
+@@ -3151,6 +3205,8 @@ static int am_handle_login(request_rec *r)
+     int is_passive;
+     int ret;
+ 
++    am_diag_printf(r, "enter function %s\n", __func__);
++
+     return_to = am_extract_query_parameter(r->pool, r->args, "ReturnTo");
+     if(return_to == NULL) {
+         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+@@ -3255,6 +3311,8 @@ static int am_handle_probe_discovery(request_rec *r) {
+     char *redirect_url;
+     int ret;
+ 
++    am_diag_printf(r, "enter function %s\n", __func__);
++
+     server = am_get_lasso_server(r);
+     if(server == NULL) {
+         return HTTP_INTERNAL_SERVER_ERROR;
+@@ -3488,6 +3546,8 @@ static int am_start_auth(request_rec *r)
+     const char *idp;
+     const char *login_url;
+ 
++    am_diag_printf(r, "enter function %s\n", __func__);
++
+     return_to = am_reconstruct_url(r);
+ 
+     /* If this is a POST request, attempt to save it */
+@@ -3539,6 +3599,8 @@ int am_auth_mellon_user(request_rec *r)
+ 	return DECLINED;
+     }
+ 
++    am_diag_printf(r, "enter function %s\n", __func__);
++
+     /* Set defaut Cache-Control headers within this location */
+     if (CFG_VALUE(dir, send_cache_control_header)) {
+         am_set_cache_control_headers(r);
+@@ -3563,6 +3625,9 @@ int am_auth_mellon_user(request_rec *r)
+         if(session == NULL || !session->logged_in) {
+             /* We don't have a valid session. */
+ 
++            am_diag_printf(r, "%s am_enable_auth, no valid session\n",
++                           __func__);
++
+             if(session) {
+                 /* Release the session. */
+                 am_release_request_session(r, session);
+@@ -3613,9 +3678,14 @@ int am_auth_mellon_user(request_rec *r)
+ #endif /* HAVE_ECP */
+         }
+ 
++        am_diag_printf(r, "%s am_enable_auth, have valid session\n",
++                       __func__);
++
+         /* Verify that the user has access to this resource. */
+         return_code = am_check_permissions(r, session);
+         if(return_code != OK) {
++            am_diag_printf(r, "%s failed am_check_permissions, status=%d\n",
++                           __func__, return_code);
+             am_release_request_session(r, session);
+ 
+             return return_code;
+@@ -3643,11 +3713,17 @@ int am_auth_mellon_user(request_rec *r)
+            && session->logged_in
+            && am_check_permissions(r, session) == OK) {
+ 
++            am_diag_printf(r, "%s am_enable_info, have valid session\n",
++                           __func__);
++
+             /* The user is authenticated and has access to the resource.
+              * Now we populate the environment with information about
+              * the user.
+              */
+             am_cache_env_populate(r, session);
++        } else {
++            am_diag_printf(r, "%s am_enable_info, no valid session\n",
++                           __func__);
+         }
+ 
+         if(session != NULL) {
+@@ -3688,6 +3764,8 @@ int am_check_uid(request_rec *r)
+ 	return DECLINED;
+     }
+ 
++    am_diag_printf(r, "enter function %s\n", __func__);
++
+ #ifdef HAVE_ECP
+     am_req_cfg_rec *req_cfg = am_get_req_cfg(r);
+     if (req_cfg->ecp_authn_req) {
+@@ -3744,11 +3822,15 @@ int am_check_uid(request_rec *r)
+ 
+     /* If we don't have a session, then we can't authorize the user. */
+     if(session == NULL) {
++        am_diag_printf(r, "%s no session, return HTTP_UNAUTHORIZED\n",
++                       __func__);
+         return HTTP_UNAUTHORIZED;
+     }
+ 
+     /* If the user isn't logged in, then we can't authorize the user. */
+     if(!session->logged_in) {
++        am_diag_printf(r, "%s session not logged in,"
++                       " return HTTP_UNAUTHORIZED\n", __func__);
+         am_release_request_session(r, session);
+         return HTTP_UNAUTHORIZED;
+     }
+@@ -3756,6 +3838,8 @@ int am_check_uid(request_rec *r)
+     /* Verify that the user has access to this resource. */
+     return_code = am_check_permissions(r, session);
+     if(return_code != OK) {
++        am_diag_printf(r, "%s failed am_check_permissions, status=%d\n",
++                       __func__, return_code);
+         am_release_request_session(r, session);
+         return return_code;
+     }
+diff --git a/auth_mellon_session.c b/auth_mellon_session.c
+index 3eae4a0..31ae5db 100644
+--- a/auth_mellon_session.c
++++ b/auth_mellon_session.c
+@@ -39,9 +39,18 @@ am_cache_entry_t *am_lock_and_validate(request_rec *r,
+                                        am_cache_key_t type,
+                                        const char *key)
+ {
+-    am_cache_entry_t *session = am_cache_lock(r, type, key);
++    am_cache_entry_t *session = NULL;
++
++    am_diag_printf(r, "searching for session with key %s (%s) ... ",
++                   key, am_diag_cache_key_type_str(type));
++
++    session = am_cache_lock(r, type, key);
+     if (session == NULL) {
++        am_diag_printf(r, "not found\n");
+         return NULL;
++    } else {
++        am_diag_printf(r, "found.\n");
++        am_diag_log_cache_entry(r, 0, session, "Session Cache Entry");
+     }
+ 
+     const char *cookie_token_session = am_cache_entry_get_string(
+@@ -123,6 +132,10 @@ am_cache_entry_t *am_new_request_session(request_rec *r)
+     am_cookie_set(r, session_id);
+ 
+     const char *cookie_token = am_cookie_token(r);
++
++    am_diag_printf(r, "%s id=%s cookie_token=\"%s\"\n",
++                   __func__, session_id, cookie_token);
++
+     return am_cache_new(r, session_id, cookie_token);
+ }
+ 
+@@ -155,6 +168,8 @@ void am_release_request_session(request_rec *r, am_cache_entry_t *session)
+  */
+ void am_delete_request_session(request_rec *r, am_cache_entry_t *session)
+ {
++    am_diag_log_cache_entry(r, 0, session, "delete session");
++
+     /* Delete the cookie. */
+     am_cookie_delete(r);
+ 
+diff --git a/auth_mellon_util.c b/auth_mellon_util.c
+index 7f8d52b..46036a9 100644
+--- a/auth_mellon_util.c
++++ b/auth_mellon_util.c
+@@ -370,6 +370,10 @@ int am_check_permissions(request_rec *r, am_cache_entry_t *session)
+ 
+         ce = &((am_cond_t *)(dir_cfg->cond->elts))[i];
+ 
++        am_diag_printf(r, "%s processing condition %d of %d: %s ",
++                       __func__, i, dir_cfg->cond->nelts,
++                       am_diag_cond_str(r, ce));
++
+         /*
+          * Rule with ignore flog?
+          */
+@@ -384,9 +388,11 @@ int am_check_permissions(request_rec *r, am_cache_entry_t *session)
+             if (!(ce->flags & AM_COND_FLAG_OR))
+                 skip_or = 0;
+ 
+-             ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+-                           "Skip %s, [OR] rule matched previously",
+-                           ce->directive);
++            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
++                          "Skip %s, [OR] rule matched previously",
++                          ce->directive);
++
++            am_diag_printf(r, "Skip, [OR] rule matched previously\n");
+             continue;
+         }
+         
+@@ -433,6 +439,8 @@ int am_check_permissions(request_rec *r, am_cache_entry_t *session)
+             ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                           "Evaluate %s vs \"%s\"", 
+                           ce->directive, value);
++
++            am_diag_printf(r, "evaluate value \"%s\" ", value);
+     
+             if (value == NULL) {
+                  match = 0;          /* can not happen */
+@@ -463,11 +471,16 @@ int am_check_permissions(request_rec *r, am_cache_entry_t *session)
+             } else {
+                  match = !strcmp(ce->str, value);
+             }
++
++        am_diag_printf(r, "match=%s, ", match ? "yes" : "no");
+         }
+ 
+-        if (ce->flags & AM_COND_FLAG_NOT)
++        if (ce->flags & AM_COND_FLAG_NOT) {
+             match = !match;
+ 
++            am_diag_printf(r, "negating now match=%s ", match ? "yes" : "no");
++        }
++
+         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                       "%s: %smatch", ce->directive,
+                       (match == 0) ? "no ": "");
+@@ -479,6 +492,9 @@ int am_check_permissions(request_rec *r, am_cache_entry_t *session)
+             ap_log_rerror(APLOG_MARK, APLOG_NOTICE, 0, r,
+                           "Client failed to match %s",
+                           ce->directive);
++
++            am_diag_printf(r, "failed (no OR condition)"
++                           " returning HTTP_FORBIDDEN\n");
+             return HTTP_FORBIDDEN;
+         }
+ 
+@@ -488,8 +504,12 @@ int am_check_permissions(request_rec *r, am_cache_entry_t *session)
+          */
+         if (match && (ce->flags & AM_COND_FLAG_OR))
+             skip_or = 1;
++
++        am_diag_printf(r, "\n");
+     }
+ 
++    am_diag_printf(r, "%s succeeds\n", __func__);
++
+     return OK;
+ }
+ 
+diff --git a/configure.ac b/configure.ac
+index 5ca2c8a..ae313e0 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -41,6 +41,16 @@ The executable may also be named 'apxs'.
+ ])
+ fi
+ 
++AC_ARG_ENABLE(
++        [diagnostics],
++        [AS_HELP_STRING([--enable-diagnostics],
++        [Build with diagnostic support])],
++        [],
++        [enable_diagnostics=no])
++
++AS_IF([test "x$enable_diagnostics" != xno],
++      [MELLON_CFLAGS="$MELLON_CFLAGS -DENABLE_DIAGNOSTICS"])
++
+ # Replace any occurances of @APXS2@ with the value of $APXS2 in the Makefile.
+ AC_SUBST(APXS2)
+ 
+@@ -74,6 +84,8 @@ PKG_CHECK_MODULES([GLIB], [glib-2.0 >= 2.12])
+ AC_SUBST(GLIB_CFLAGS)
+ AC_SUBST(GLIB_LIBS)
+ 
++AC_SUBST(MELLON_CFLAGS)
++
+ # Test to see if we can include lasso/utils.h
+ # AC_CHECK_HEADER won't work correctly unless we specifiy the include directories
+ # found in the LASSO_CFLAGS. Save and restore CFLAGS and CPPFLAGS.
+diff --git a/mod_auth_mellon.c b/mod_auth_mellon.c
+index f632d37..74bd328 100644
+--- a/mod_auth_mellon.c
++++ b/mod_auth_mellon.c
+@@ -195,6 +195,9 @@ static int am_create_request(request_rec *r)
+ #ifdef HAVE_ECP
+     req_cfg->ecp_authn_req = false;
+ #endif /* HAVE_ECP */
++#ifdef ENABLE_DIAGNOSTICS
++    req_cfg->diag_emitted = false;
++#endif
+ 
+     ap_set_module_config(r->request_config, &auth_mellon_module, req_cfg);
+ 
+@@ -220,6 +223,11 @@ static void register_hooks(apr_pool_t *p)
+      * r->handler and decide that it is the only handler for this URL.
+      */
+     ap_hook_handler(am_handler, NULL, NULL, APR_HOOK_FIRST);
++
++#ifdef ENABLE_DIAGNOSTICS
++    ap_hook_open_logs(am_diag_log_init,NULL,NULL,APR_HOOK_MIDDLE);
++    ap_hook_log_transaction(am_diag_finalize_request,NULL,NULL,APR_HOOK_REALLY_LAST);
++#endif
+ }
+ 
+ 
+@@ -229,7 +237,7 @@ module AP_MODULE_DECLARE_DATA auth_mellon_module =
+     auth_mellon_dir_config,
+     auth_mellon_dir_merge,
+     auth_mellon_server_config,
+-    NULL,
++    auth_mellon_srv_merge,
+     auth_mellon_commands,
+     register_hooks
+ };

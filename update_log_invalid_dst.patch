@@ -11,7 +11,7 @@ index afb3195..030abe7 100644
 @@ -1461,8 +1461,8 @@ static int am_validate_conditions(request_rec *r,
  
          if (ar->Audience == NULL || strcmp(ar->Audience, providerID)) {
-             ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+             AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
 -                          "Invalid Audience in Conditions. Should be: %s",
 -                          providerID);
 +                          "Invalid Audience in Conditions. Should be '%s', but was '%s'",
@@ -22,7 +22,7 @@ index afb3195..030abe7 100644
 @@ -1791,8 +1791,8 @@ static int am_handle_reply_common(request_rec *r, LassoLogin *login,
      if (response->parent.Destination) {
          if (strcmp(response->parent.Destination, url)) {
-             ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+             AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
 -                          "Invalid Destination on Response. Should be: %s",
 -                          url);
 +                          "Invalid Destination on Response. Should be '%s', but was '%s'",

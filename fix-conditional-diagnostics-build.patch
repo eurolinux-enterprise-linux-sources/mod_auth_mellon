@@ -1,0 +1,39 @@
+commit 86eb3440b260c7227f4e8d059f9b2410007fa350
+Author: John Dennis <jdennis@redhat.com>
+Date:   Thu Dec 7 15:17:03 2017 -0500
+
+    Fix conditional build of auth_mellon_diagnostics.c
+    
+    Commit de853e15 introduced using config.h to define optional build
+    parameters instead of putting them on the compile command
+    line. Unfortunately that broke the compilation of
+    auth_mellon_diagostics.c.
+    
+    We used to have this:
+    
+    ifdef ENABLE_DIAGNOSTICS
+    include "auth_mellon.h"
+    
+    but the flag ENABLE_DIAGNOSTICS is now defined by including
+    auth_mellon.h (which includes config.h) hence it would be impossible
+    for the ENABLE_DIAGNOSTICS to be defined during compilation.
+    
+    The solution is simple, just reverse the order of the two lines such
+    that the defines are seen before the #ifdef conditional.
+    
+    Signed-off-by: John Dennis <jdennis@redhat.com>
+
+diff --git a/auth_mellon_diagnostics.c b/auth_mellon_diagnostics.c
+index 519a44f..289a878 100644
+--- a/auth_mellon_diagnostics.c
++++ b/auth_mellon_diagnostics.c
+@@ -1,7 +1,7 @@
+-#ifdef ENABLE_DIAGNOSTICS
+-
+ #include "auth_mellon.h"
+ 
++#ifdef ENABLE_DIAGNOSTICS
++
+ #if APR_HAVE_UNISTD_H
+ #include <unistd.h>
+ #endif
