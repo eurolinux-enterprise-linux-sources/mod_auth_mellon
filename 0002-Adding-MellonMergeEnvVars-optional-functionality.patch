@@ -1,0 +1,184 @@
+From 1d61071f18a0e63e03b9c37cc407327b91fc6273 Mon Sep 17 00:00:00 2001
+From: Jarek Polok <jpolok@xenophile.cern.ch>
+Date: Tue, 11 Nov 2014 17:38:57 +0100
+Subject: [PATCH] Adding MellonMergeEnvVars (optional) functionality Allows to
+ concatenate env. variables values in single variable name, ie:
+
+VAR=val1;val2;val3;...
+
+instead of standard mod_auth_mellom behaviour:
+
+VAR=val1
+VAR_0=val1
+VAR_1=val2
+VAR_2=val3
+...
+---
+ README               | 16 ++++++++++++++++
+ auth_mellon.h        |  1 +
+ auth_mellon_cache.c  | 35 ++++++++++++++++++++++++++---------
+ auth_mellon_config.c | 18 ++++++++++++++++++
+ 4 files changed, 61 insertions(+), 9 deletions(-)
+
+diff --git a/README b/README
+index 238171301a857b9ede7933b9f4981c4bb58731ec..b5ff9b8ed8364367c32d8251d3d69fc27046d1dd 100644
+--- a/README
++++ b/README
+@@ -232,6 +232,13 @@ MellonPostCount 100
+         # Default. None set.
+         MellonSetEnvNoPrefix "DISPLAY_NAME" "displayName"
+ 
++        # MellonMergeEnvVars merges multiple values of environement variables
++        # set using MellonSetEnv into single variable:
++        # ie: MYENV_VAR => val1;val2;val3 instead of default behaviour of:
++        #     MYENV_VAR_0 => val1, MYENV_VAR_1 => val2 ... etc.
++        # Default: MellonMergeEnvVars Off
++        MellonMergeEnvVars On
++
+         # If MellonSessionDump is set, then the SAML session will be
+         # available in the MELLON_SESSION environment variable
+         MellonSessionDump Off
+@@ -590,6 +597,15 @@ MELLON_<name>, and once named <MELLON_<name>_0.
+ In the case of multivalued attributes MELLON_<name> will contain the first
+ value.
+ 
++NOTE: 
++
++if MellonMergeEnvVars is set to On multiple values of attributes 
++will be stored in single environement variable, separated by ";" 
++
++MELLON_<name> -> "value1;value2;value3[;valueX]"
++
++and variables MELLON_<name>_0, MELLON_<name>_1, MELLON_<name>_2 will 
++not be created.
+ 
+ The following code is a simple php-script which prints out all the
+ variables:
+diff --git a/auth_mellon.h b/auth_mellon.h
+index e915cbfbdd33072637780145ce5d7fcf7d9ebc88..8649674617d9cb31438e9d73a822f688ce43182f 100644
+--- a/auth_mellon.h
++++ b/auth_mellon.h
+@@ -175,6 +175,7 @@ typedef struct am_dir_cfg_rec {
+ 
+     const char *varname;
+     int secure;
++    int merge_env_vars;
+     const char *cookie_domain;
+     const char *cookie_path;
+     apr_array_header_t *cond;
+diff --git a/auth_mellon_cache.c b/auth_mellon_cache.c
+index ed96732c5dec221443839be91dda50431834611b..1982e604049ca6655ea93034d5f05dd72281b34e 100644
+--- a/auth_mellon_cache.c
++++ b/auth_mellon_cache.c
+@@ -521,6 +521,7 @@ void am_cache_env_populate(request_rec *r, am_cache_entry_t *t)
+     const char *varname;
+     const char *varname_prefix;
+     const char *value;
++    const char *prefixed_varname;
+     int *count;
+     int status;
+ 
+@@ -581,6 +582,8 @@ void am_cache_env_populate(request_rec *r, am_cache_entry_t *t)
+             }
+         }
+ 
++        prefixed_varname = apr_pstrcat(r->pool, varname_prefix, varname, NULL);
++
+         /* Find the number of times this variable has been set. */
+         count = apr_hash_get(counters, varname, APR_HASH_KEY_STRING);
+         if(count == NULL) {
+@@ -591,18 +594,32 @@ void am_cache_env_populate(request_rec *r, am_cache_entry_t *t)
+             apr_hash_set(counters, varname, APR_HASH_KEY_STRING, count);
+ 
+             /* Add the variable without a suffix. */
++            apr_table_set(r->subprocess_env,prefixed_varname,value);
++        }
++
++        if (d->merge_env_vars != 1) {
++         
++            /* Add the variable with a suffix indicating how many times it has
++             * been added before.
++             */
+             apr_table_set(r->subprocess_env,
+-                          apr_pstrcat(r->pool, varname_prefix, varname, NULL),
++                          apr_psprintf(r->pool, "%s_%d", prefixed_varname, *count),
+                           value);
++
++        } else if (*count > 0) {
++
++            /*
++             * Merge multiple values, separating with ";" 
++             * this makes auth_mellon work same way mod_shib is:
++             * https://wiki.shibboleth.net/confluence/display/SHIB2/NativeSPAttributeAccess
++             */
++             apr_table_set(r->subprocess_env,
++                           prefixed_varname,
++                           apr_pstrcat(r->pool, 
++                                       apr_table_get(r->subprocess_env,prefixed_varname),
++                                       ";", value, NULL));
+         }
+-
+-        /* Add the variable with a suffix indicating how many times it has
+-         * been added before.
+-         */
+-        apr_table_set(r->subprocess_env,
+-                      apr_psprintf(r->pool, "%s%s_%d", varname_prefix, varname, *count),
+-                      value);
+-
++          
+         /* Increase the count. */
+         ++(*count);
+     }
+diff --git a/auth_mellon_config.c b/auth_mellon_config.c
+index dbcbfaa6604f4bdcfdf940a1d724947ff1100a6e..d3a408a6bcbec4fc1286222542aecbfcd3ba43e9 100644
+--- a/auth_mellon_config.c
++++ b/auth_mellon_config.c
+@@ -70,6 +70,12 @@ static const apr_size_t post_size = 1024 * 1024 * 1024;
+  */
+ static const int post_count = 100;
+ 
++/* whether to merge env. vars or not
++ * the MellonMergeEnvVars configuration directive if you change this.
++ */
++static const int default_merge_env_vars = -1;
++
++
+ /* This function handles configuration directives which set a 
+  * multivalued string slot in the module configuration (the destination
+  * strucure is a hash).
+@@ -1218,6 +1224,13 @@ const command_rec auth_mellon_commands[] = {
+         OR_AUTHCFG,
+         "Whether we should replay POST requests that trigger authentication. Default is off."
+         ),
++    AP_INIT_FLAG(
++        "MellonMergeEnvVars",
++        ap_set_flag_slot,
++        (void *)APR_OFFSETOF(am_dir_cfg_rec, merge_env_vars),
++        OR_AUTHCFG,
++        "Whether to merge environement variables multi-values or not. Default is off."
++        ),
+     {NULL}
+ };
+ 
+@@ -1273,6 +1286,7 @@ void *auth_mellon_dir_config(apr_pool_t *p, char *d)
+ 
+     dir->varname = default_cookie_name;
+     dir->secure = default_secure_cookie;
++    dir->merge_env_vars = default_merge_env_vars;
+     dir->cond = apr_array_make(p, 0, sizeof(am_cond_t));
+     dir->cookie_domain = NULL;
+     dir->cookie_path = NULL;
+@@ -1393,6 +1407,10 @@ void *auth_mellon_dir_merge(apr_pool_t *p, void *base, void *add)
+                         add_cfg->secure :
+                         base_cfg->secure);
+ 
++    new_cfg->merge_env_vars = (add_cfg->merge_env_vars != default_merge_env_vars ?
++                               add_cfg->merge_env_vars :
++                               base_cfg->merge_env_vars);
++
+     new_cfg->cookie_domain = (add_cfg->cookie_domain != NULL ?
+                         add_cfg->cookie_domain :
+                         base_cfg->cookie_domain);
+-- 
+2.1.0
+

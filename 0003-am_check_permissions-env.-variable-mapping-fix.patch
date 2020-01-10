@@ -1,0 +1,42 @@
+From 718fd6a0420bcaff04a2f896e294ea2b7abc9680 Mon Sep 17 00:00:00 2001
+From: Jarek Polok <jaroslaw.polok@cern.ch>
+Date: Sun, 16 Nov 2014 11:04:04 +0100
+Subject: [PATCH] am_check_permissions() env. variable mapping fix.
+
+---
+ auth_mellon_util.c | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/auth_mellon_util.c b/auth_mellon_util.c
+index d3acc959eb35e6458b90a093056af026d8ab4854..4b7e657938a47326cf4881da645659228ba2b578 100644
+--- a/auth_mellon_util.c
++++ b/auth_mellon_util.c
+@@ -300,16 +300,20 @@ int am_check_permissions(request_rec *r, am_cache_entry_t *session)
+          */
+         for (j = 0; (j < session->size) && !match; j++) {
+             const char *varname = NULL;
++            am_envattr_conf_t *envattr_conf = NULL;
+ 
+             /*
+              * if MAP flag is set, check for remapped 
+              * attribute name with mellonSetEnv
+              */
+-            if (ce->flags & AM_COND_FLAG_MAP)
+-                varname = apr_hash_get(dir_cfg->envattr, 
+-                                       am_cache_entry_get_string(session,
+-                                                    &session->env[j].varname),
+-                                       APR_HASH_KEY_STRING);
++            if (ce->flags & AM_COND_FLAG_MAP) {
++                envattr_conf =  (am_envattr_conf_t *)apr_hash_get(dir_cfg->envattr, 
++                                         am_cache_entry_get_string(session,&session->env[j].varname),
++                                         APR_HASH_KEY_STRING);
++                                                    
++                if (envattr_conf != NULL)
++                    varname = envattr_conf->name;
++            }
+ 
+             /*
+              * Otherwise or if not found, use the attribute name
+-- 
+2.1.0
+
